@@ -233,16 +233,36 @@ def reply_feishu_msg(client, message_id, text_content):
         log_chat("out", "bot", text_content)  # 发消息持久化
 
 
-def send_progress_card(client, receive_id, title, body_text):
+def send_progress_card(client, receive_id, title, body_text, details_text=None):
     """发送一张 interactive 进度卡片，返回 msg_id（供后续 PATCH 更新）"""
     from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": title}},
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": body_text}}
-        ],
-    }
+    if details_text is None:
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": title}},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": body_text}}],
+        }
+    else:
+        card = {
+            "schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": title}},
+            "body": {"elements": [
+                {"tag": "markdown", "content": body_text},
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "查看完整会议纪要"},
+                        "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"},
+                        "icon_position": "right",
+                        "icon_expanded_angle": -180,
+                    },
+                    "border": {"color": "grey", "corner_radius": "5px"},
+                    "padding": "8px",
+                    "elements": [{"tag": "markdown", "content": details_text[:18000]}],
+                },
+            ]},
+        }
     req = (
         CreateMessageRequest.builder()
         .receive_id_type("chat_id")
@@ -288,48 +308,6 @@ def update_progress_card(client, message_id, title, body_text):
     if not resp.success():
         print(f"[Feishu Card Update Error] code: {resp.code}, msg: {resp.msg}")
     return resp.success()
-
-
-def send_feishu_file(client, chat_id, file_path, display_name=None):
-    """Upload a local artifact and send it as a clickable Feishu attachment."""
-    from lark_oapi.api.im.v1 import (
-        CreateFileRequest,
-        CreateFileRequestBody,
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-    )
-    if not os.path.isfile(file_path):
-        return None
-    with open(file_path, "rb") as handle:
-        upload = client.im.v1.file.create(
-            CreateFileRequest.builder().request_body(
-                CreateFileRequestBody.builder()
-                .file_type("stream")
-                .file_name(display_name or os.path.basename(file_path))
-                .file(handle)
-                .build()
-            ).build()
-        )
-    if not upload.success():
-        print(f"[Feishu File Upload Error] code: {upload.code}, msg: {upload.msg}")
-        return None
-    request = (
-        CreateMessageRequest.builder()
-        .receive_id_type("chat_id")
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("file")
-            .content(json.dumps({"file_key": upload.data.file_key}))
-            .build()
-        ).build()
-    )
-    response = client.im.v1.message.create(request)
-    if not response.success():
-        print(f"[Feishu File Send Error] code: {response.code}, msg: {response.msg}")
-        return None
-    log_chat("out", "bot", f"[文件] {display_name or os.path.basename(file_path)}", chat_id)
-    return response.data.message_id
 
 
 TASK_STATUS_TEXT = {
@@ -394,10 +372,17 @@ def _run_roundtable_task(client, task, context):
         reply_feishu_msg(client, msg_id, f"🏁【会议完成】\n{result['final_summary']}")
     minutes_rel = f"roundtable/{result['session_id']}/minutes.md"
     minutes_path = os.path.join(os.path.dirname(__file__), *minutes_rel.split("/"))
-    attachment = send_feishu_file(
-        client, chat_id, minutes_path, display_name=f"会议纪要-{task['id']}.md",
-    )
-    if not attachment:
+    try:
+        with open(minutes_path, encoding="utf-8") as handle:
+            minutes_text = handle.read()
+    except OSError:
+        minutes_text = ""
+    minutes_card = send_progress_card(
+        client, chat_id, f"📎 会议纪要 · {task['id']}",
+        f"会议已完成。点击下方标题展开查看。\n\n本地归档：`{minutes_rel}`",
+        details_text=minutes_text,
+    ) if minutes_text else None
+    if not minutes_card:
         reply_feishu_msg(client, msg_id, f"📎 任务 {task['id']} · 纪要：{minutes_rel}")
     if project:
         MEMORY_STORE.add(result["final_summary"], project_name=project, source_type="roundtable",

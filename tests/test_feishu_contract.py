@@ -1,4 +1,5 @@
 import json
+import io
 from types import SimpleNamespace
 
 import bot
@@ -36,7 +37,7 @@ def test_normal_chat_is_acknowledged_without_running_agent_inline(monkeypatch):
 
 
 def test_roundtable_speech_only_updates_one_card(monkeypatch):
-    replies, updates, files = [], [], []
+    replies, updates, cards = [], [], []
 
     class Context:
         def check_cancelled(self): pass
@@ -52,23 +53,22 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
                     "unavailable_agents": {}}
 
     monkeypatch.setattr(bot, "RoundTableV2", Engine)
-    monkeypatch.setattr(bot, "send_progress_card", lambda *args, **kwargs: "card-1")
+    monkeypatch.setattr(bot, "send_progress_card", lambda *args, **kwargs:
+                        cards.append((args, kwargs)) or "card-1")
     monkeypatch.setattr(bot, "update_progress_card", lambda *args, **kwargs: updates.append(args) or True)
     monkeypatch.setattr(bot, "reply_feishu_msg", lambda client, message_id, text: replies.append(text))
-    monkeypatch.setattr(bot, "send_feishu_file", lambda client, chat_id, path, display_name=None:
-                        files.append((chat_id, path, display_name)) or "file-message")
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO("# 会议纪要\n完整内容"))
     task = {"id": "t1", "payload": {"topic": "欢迎语", "project": None},
             "message_id": "m1", "chat_id": "c1"}
     bot._run_roundtable_task(None, task, Context())
     assert all("不应单独发出的正文" not in reply for reply in replies)
     assert replies == []
-    assert files and files[0][2] == "会议纪要-t1.md"
+    assert len(cards) == 2
+    assert cards[1][1]["details_text"].startswith("# 会议纪要")
     assert updates and any("最终总结" in str(args) for args in updates)
 
 
-def test_minutes_file_is_uploaded_and_sent_as_attachment(tmp_path, monkeypatch):
-    minutes = tmp_path / "minutes.md"
-    minutes.write_text("# 会议纪要", encoding="utf-8")
+def test_minutes_card_uses_clickable_collapsible_panel(monkeypatch):
     captured = {}
 
     class Response:
@@ -76,24 +76,18 @@ def test_minutes_file_is_uploaded_and_sent_as_attachment(tmp_path, monkeypatch):
             self.data, self.code, self.msg = data, 0, ""
         def success(self): return True
 
-    class FileApi:
-        def create(self, request):
-            captured["upload"] = request.body
-            return Response(SimpleNamespace(file_key="file-key"))
-
     class MessageApi:
         def create(self, request):
             captured["message"] = request.body
             return Response(SimpleNamespace(message_id="message-id"))
 
     client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(
-        file=FileApi(), message=MessageApi(),
+        message=MessageApi(),
     )))
-    monkeypatch.setattr(bot, "log_chat", lambda *args, **kwargs: None)
-
-    message_id = bot.send_feishu_file(client, "chat-1", str(minutes), "会议纪要-test.md")
+    message_id = bot.send_progress_card(client, "chat-1", "会议纪要", "点击展开", "# 完整内容")
     assert message_id == "message-id"
-    assert captured["upload"].file_type == "stream"
-    assert captured["upload"].file_name == "会议纪要-test.md"
-    assert captured["message"].msg_type == "file"
-    assert json.loads(captured["message"].content) == {"file_key": "file-key"}
+    card = json.loads(captured["message"].content)
+    assert card["schema"] == "2.0"
+    panel = card["body"]["elements"][1]
+    assert panel["tag"] == "collapsible_panel" and panel["expanded"] is False
+    assert panel["elements"][0]["content"] == "# 完整内容"
