@@ -124,7 +124,10 @@ def call_hermes(task_text, timeout=300):
     task_file = isolated_prompt_file("hermes_", task_text)
     bash_path = task_file.replace("E:", "/mnt/e").replace("\\", "/") if task_file.startswith("E:") else task_file
     hermes = shlex.quote(str(runtime_value("hermes_command")))
-    command = ["wsl.exe", "-e", "bash", "-lc", f'{hermes} -z "$(cat "$1")" -t terminal', "bash", bash_path]
+    command = [
+        "wsl.exe", "-e", "bash", "-lc",
+        f'{hermes} -z "$(cat "$1")" -t clarify --safe-mode', "bash", bash_path,
+    ]
     return _run("hermes", command, timeout, BASE_DIR)
 
 
