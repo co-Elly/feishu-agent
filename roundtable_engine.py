@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from agent_runtime import call_codex, isolated_prompt_file
+from agent_runtime import AgentResult, call_antigravity, call_codex, call_hermes, cooldown_seconds
 from task_manager import TaskCancelled
 
 # ---------------------------------------------------------------- 路径与 DB
@@ -434,105 +434,9 @@ def meeting_converged(round_no, stances_now, prev_stances):
     return False, "running"
 
 
-# ---------------------------------------------------------------- 真身通道
-def call_real_antigravity(task_text, timeout=200, max_retries=1, model="low"):
-    """真实反重力：桌面端 agy CLI（Google AI Pro 免费额度）
-
-    model: "low"=gemini-3.1-pro-low（快速档，日常） / "high"=gemini-3.1-pro-high（质量档，重要议题）
-    """
-    task_file = isolated_prompt_file("agy_roundtable_", task_text)
-    # 转 Windows 路径
-    if task_file.startswith("/mnt/"):
-        drive = task_file[5].upper()
-        task_file_win = f"{drive}:{task_file[6:].replace('/', chr(92))}"
-    else:
-        task_file_win = task_file
-    import subprocess
-    # 按 model 档位选 ps1：low=pro_low（快）/ high=pro（质量）
-    script_name = "run_task_pro.ps1" if model == "high" else "run_task_pro_low.ps1"
-    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-           rf"C:\Users\26420\AppData\Local\agy\{script_name}", task_file_win]
-    work_cwd = "C:\\" if os.path.exists("C:\\") else "/mnt/c"
-    last_err = ""
-    for attempt in range(max_retries + 1):
-        try:
-            proc = subprocess.run(
-                cmd, shell=False, capture_output=True, encoding="utf-8",
-                errors="replace", timeout=timeout, cwd=work_cwd,
-            )
-            stdout = (proc.stdout or "").strip()
-            stderr = (proc.stderr or "").strip()
-            if stdout:
-                return stdout
-            elif stderr:
-                last_err = f"反重力报错: {stderr[:200]}"
-        except subprocess.TimeoutExpired:
-            last_err = "反重力思考超时"
-        except Exception as e:
-            last_err = f"反重力调用异常: {str(e)}"
-        # 瞬时故障（认证 EOF/网络）重试一次，慢速退避
-        if attempt < max_retries and any(
-            kw in last_err for kw in ["Eligibility", "EOF", "network", "timeout", "proxy"]
-        ):
-            time.sleep(8)
-            continue
-        break
-    return last_err if last_err else "反重力执行完成，无输出。"
-
-
-def call_real_hermes(task_text, timeout=300, max_retries=1):
-    """真实 Hermes：WSL 内 hermes -z（任务书文件方式，彻底避免引号转义炸弹）"""
-    try:
-        import subprocess
-        # 写任务书（Windows Python 用 E:\\...，WSL Python 用 /mnt/e/...）
-        task_file = isolated_prompt_file("hermes_roundtable_", task_text)
-        # bash 里 cat 需要 WSL 路径（/mnt/e/feishu-agent/hermes_task.txt）
-        if task_file.startswith("E:"):
-            bash_path = task_file.replace("E:", "/mnt/e").replace("\\", "/")
-        elif task_file.startswith("/mnt/"):
-            bash_path = task_file
-        else:
-            bash_path = task_file
-        # WSL 侧读取任务书文件再传给 hermes -z
-        # ⚠️ cmd.exe 不识别单引号：必须用双引号包整体 + \" 转义内部引号（实测通过）
-        # ⚠️ -t terminal 限工具集：系统提示词从 ~17万 tokens 缩到几万 → 单次调用 158s → 22s（2026-08-16 实测）
-        # ⚠️ 参数顺序：-z 必须紧跟提示词，-t 放最后（argparse 对 -z 后接 -t 会报 expected one argument）
-        cmd = ["wsl.exe", "-e", "bash", "-lc", 'hermes -z "$(cat "$1")" -t terminal', "bash", bash_path]
-        work_cwd = "E:\\feishu-agent" if os.path.exists("E:\\feishu-agent") else BASE_DIR
-        last_err = ""
-        for attempt in range(max_retries + 1):
-            try:
-                proc = subprocess.run(
-                    cmd, shell=False, capture_output=True, encoding="utf-8",
-                    errors="replace", timeout=timeout, cwd=work_cwd,
-                )
-                stdout = (proc.stdout or "").strip()
-                stderr = (proc.stderr or "").strip()
-                if stdout:
-                    return stdout
-                elif stderr:
-                    last_err = f"Hermes 报错: {stderr[:300]}"
-            except subprocess.TimeoutExpired:
-                last_err = "Hermes 思考超时（请稍后重试或缩小议题）"
-            except Exception as e:
-                last_err = f"Hermes 调用异常: {str(e)}"
-            # 瞬时故障（思考超时/网络）重试一次
-            if attempt < max_retries and any(
-                kw in last_err for kw in ["思考超时", "TimeoutExpired", "network", "proxy", "EOF"]
-            ):
-                time.sleep(8)
-                continue
-            break
-        return last_err if last_err else "Hermes 执行完成，无输出。"
-    except subprocess.TimeoutExpired:
-        return "Hermes 思考超时（请稍后重试或缩小议题）"
-    except Exception as e:
-        return f"Hermes 调用异常: {str(e)}"
-
-
 ENGINE_CALLS = {
-    "hermes": call_real_hermes,
-    "antigravity": call_real_antigravity,
+    "hermes": call_hermes,
+    "antigravity": call_antigravity,
     "codex": call_codex,
 }
 
@@ -551,6 +455,8 @@ class RoundTableQuorumError(RuntimeError):
 
 
 def is_engine_error(reply):
+    if isinstance(reply, AgentResult):
+        return not reply.ok
     return any(prefix in (reply or "") for prefix in ENGINE_ERROR_PREFIXES)
 
 
@@ -561,7 +467,7 @@ def _cooldown_seconds(reply):
         return max(30, hours * 3600 + minutes * 60 + seconds + 10)
     if "401 Unauthorized" in (reply or ""):
         return 300
-    return 60
+    return cooldown_seconds(reply, "process_error") or 60
 
 
 def _engine_cooldown_remaining(engine):
@@ -619,19 +525,22 @@ class RoundTableV2:
         self._calls += 1  # 真实发言调用计数
         try:
             if agent["engine"] == "antigravity":
-                reply = ENGINE_CALLS[agent["engine"]](prompt, model=antigravity_model)
+                result = ENGINE_CALLS[agent["engine"]](prompt, model=antigravity_model)
             else:
-                reply = ENGINE_CALLS[agent["engine"]](prompt)
+                result = ENGINE_CALLS[agent["engine"]](prompt)
             # ⚠️ 只缓存成功结果：错误/超时报错不缓存（否则重试永远拿到旧错误）
             # 精确匹配引擎级报错前缀，避免发言正文中提及“报错排查/错误分析”导致误伤
             # ⚠️ 2026-08-16 修复：删除泛化词 "Eligibility"/"unexpected EOF" ——
             # 发言正文提到这些词（如描述崩溃事故）会被误判 failed（R1 反重力两次踩坑）。
             # 各通道错误返回必带专属前缀（"反重力报错:"/"反重力思考超时"等），前缀匹配足够。
-            if is_engine_error(reply):
+            if not result.ok:
+                reply = result.text
                 self._errors += 1
-                _mark_engine_unavailable(agent["engine"], reply)
+                with _ENGINE_COOLDOWN_LOCK:
+                    _ENGINE_COOLDOWNS[agent["engine"]] = result.cooldown_until or (time.time() + 60)
                 mark_turn(request_id, "failed", error=reply)
                 return reply
+            reply = result.text
             mark_turn(request_id, "done", output=reply)
             cache_set(request_id, reply)
             return reply
@@ -688,12 +597,14 @@ class RoundTableV2:
         return reply
 
     # ---- 主流程
-    def run(self, topic, on_event=None, cancel_check=None):
+    def run(self, topic, on_event=None, cancel_check=None, memory_context=""):
         """主持一场收敛式圆桌讨论；on_event(msg_type, payload) 供飞书播报"""
         # 断点续跑：回收上次崩溃遗留的 running 任务（幂等缓存保证不重复执行）
         reclaim_stale(running_timeout=600, session_timeout=3600)
         # 先预研再创建本场，避免把刚创建的 running session 误认成历史会议。
         topic_ctx = research_topic(topic)
+        if memory_context:
+            topic_ctx = f"{topic_ctx}\n\n{memory_context}".strip()
         session_id = create_session(topic)
         # 会议报告卡：重置统计 + 开始计时
         self._t0 = time.time()

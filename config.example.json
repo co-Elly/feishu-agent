@@ -10,5 +10,15 @@
   "gemini": {
     "api_key": "${GEMINI_API_KEY}",
     "model": "gemini-2.5-flash"
+  },
+  "runtime": {
+    "workspace_dir": "E:\\feishu-agent\\workspace",
+    "obsidian_vault": "E:\\Obsidian_Vault\\多agent",
+    "antigravity_script_high": "C:\\Users\\YOUR_NAME\\AppData\\Local\\agy\\run_task_pro.ps1",
+    "antigravity_script_low": "C:\\Users\\YOUR_NAME\\AppData\\Local\\agy\\run_task_pro_low.ps1",
+    "codex_command": "codex",
+    "hermes_command": "hermes",
+    "approval_ttl_seconds": 1800,
+    "task_workers": 4
   }
 }

@@ -14,7 +14,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
     P2ImMessageReceiveV1,
 )
-from swarm_orchestrator import swarm_orchestrator, roundtable
+from swarm_orchestrator import swarm_orchestrator
 from roundtable_engine import RoundTableV2
 from conversation_store import (
     add_exchange,
@@ -23,7 +23,11 @@ from conversation_store import (
     get_history as get_stored_history,
     migrate_legacy_json,
 )
-from agent_runtime import isolated_prompt_file
+from agent_runtime import call_hermes, deep_health_probe, lightweight_health
+from command_parser import extract_project_tag, parse_memory_command
+from control_store import engine_health, record_task_event
+from memory_store import MemoryStore
+from settings import load_config, runtime_value, validate_startup
 from task_manager import TaskCancelled, TaskController
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -31,13 +35,13 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 CHAT_LOG_PATH = os.path.join(os.path.dirname(__file__), "chat_log.jsonl")      # 收发消息日志（append-only）
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "chat_history.json")    # 对话历史持久化
 
 MAX_HISTORY_TURNS = 10
 MESSAGE_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("FEISHU_MAX_WORKERS", "4")))
-TASK_CONTROLLER = TaskController(max_workers=int(os.environ.get("FEISHU_TASK_WORKERS", "2")))
+TASK_CONTROLLER = TaskController(max_workers=int(os.environ.get("FEISHU_TASK_WORKERS", runtime_value("task_workers"))))
+MEMORY_STORE = MemoryStore()
 _CHAT_LOCKS = {}
 _CHAT_LOCKS_GUARD = threading.Lock()
 
@@ -71,11 +75,6 @@ def load_histories():
     """Initialize storage and import the legacy JSON once."""
     imported = migrate_legacy_json()
     print(f"[History Store] SQLite ready; imported {imported} legacy messages")
-
-
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def get_proxy():
@@ -131,48 +130,11 @@ def load_persistent_memory():
 
 
 def get_desktop_context():
-    mem = load_persistent_memory()
-    milestones = mem.get("project_milestones", [])
-    recent_tasks = mem.get("task_history", [])[-5:]
-    sched_tasks = mem.get("active_scheduled_tasks", [])
-
-    ms_text = "\n".join(
-        [
-            f"- [{m.get('time')}] {m.get('project')}: {m.get('summary')}"
-            for m in milestones
-        ]
+    return (
+        "【桌面环境】Windows 个人工作站；团队为 Hermes、反重力、Codex。\n"
+        f"Obsidian 工作台：{runtime_value('obsidian_vault')}\n"
+        + MEMORY_STORE.prompt_context("")
     )
-    task_text = (
-        "\n".join(
-            [
-                f"- [{t.get('time')}] 【{t.get('agent')}】任务: {t.get('task')}"
-                for t in recent_tasks
-            ]
-        )
-        if recent_tasks
-        else "暂无最近任务"
-    )
-    sched_text = "\n".join(
-        [
-            f"- {s.get('task_name')} ({s.get('schedule')}): {s.get('action')}"
-            for s in sched_tasks
-        ]
-    )
-
-    return f"""
-【用户与桌面环境全局记忆档案】：
-- 用户姓名: 林家泽
-- 操作系统: Windows 11 (WSL2 Ubuntu 24.04)
-- 团队成员:「Hermes 主脑」(产品经理·主持人)、「反重力」(Antigravity 架构师)、「Codex」(核心工程师)
-- Obsidian 项目总工作台: E:\\Obsidian_Vault\\多agent\\ (采用三级目录规范)
-- 系统常驻定时任务：
-{sched_text}
-- 电脑已完成的项目里程碑：
-{ms_text}
-- 最近执行过的任务记录：
-{task_text}
-（你可以完全回忆并基于上述已完成的项目、定时任务与历史记录，与用户无缝对话或继续迭代！）
-"""
 
 
 def chat_with_deepseek(user_id, user_prompt):
@@ -223,7 +185,7 @@ def chat_with_deepseek(user_id, user_prompt):
         return f"DeepSeek 调用异常: {str(e)}"
 
 
-def chat_with_hermes(user_id, user_prompt):
+def chat_with_hermes(user_id, user_prompt, project_name=None):
     """【主脑管家】调用 WSL 中的真实 Hermes Agent 处理消息（替换原 DeepSeek 管家）"""
     # 附带最近的对话历史，让 Hermes 有上下文连续感
     session_key = f"{user_id}:hermes"
@@ -236,39 +198,19 @@ def chat_with_hermes(user_id, user_prompt):
             lines.append(f"{role}: {item['content'][:200]}")
         history_text = "\n".join(lines) + "\n"
 
+    memory_context = MEMORY_STORE.prompt_context(user_prompt, project_name=project_name)
     full_prompt = (
         f"你在飞书里是老板林家泽的贴身管家 Hermes。\n"
         f"以下是最近的对话上下文（可能为空）：\n{history_text}\n"
+        f"{memory_context}\n"
         f"请针对老板最新的消息给出亲切、干练、简洁的中文回复：\n"
         f"老板：{user_prompt}"
     )
-
-    try:
-        # 任务书文件方式（避免 cmd.exe 单引号坑：heredoc 含引号会 unexpected EOF）
-        # + -t terminal 限工具集：系统提示词 ~17万→几万 tokens，单次调用 158s → ~20s（2026-08-16 实测）
-        # ⚠️ 参数顺序：-z 必须紧跟提示词，-t 放最后（argparse 对 -z 后接 -t 报 expected one argument）
-        task_file = isolated_prompt_file("hermes_chat_", full_prompt)
-        bash_path = task_file.replace("E:", "/mnt/e").replace("\\", "/") if task_file.startswith("E:") else task_file
-        # ⚠️ 参数顺序：-z 后必须紧跟 prompt，-t 选项放最后（argparse 不允许 -z -t ... 交错）
-        cmd = ["wsl.exe", "-e", "bash", "-lc", 'hermes -z "$(cat "$1")" -t terminal', "bash", bash_path]
-        proc = subprocess.run(
-            cmd,
-            shell=False,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=150,
-            cwd=r"E:\feishu-agent",
-        )
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        reply_text = stdout if stdout else (f"Hermes 报错: {stderr}" if stderr else "Hermes 执行完成，无输出。")
+    result = call_hermes(full_prompt, timeout=150)
+    reply_text = result.text
+    if result.ok:
         add_history(session_key, user_prompt, reply_text)
-        return reply_text
-    except subprocess.TimeoutExpired:
-        return "【管家】思考时间较长，请稍等再问我一次～（Hermes 超时 150 秒）"
-    except Exception as e:
-        return f"【管家】调用异常: {str(e)}"
+    return result
 
 
 def reply_feishu_msg(client, message_id, text_content):
@@ -390,14 +332,15 @@ def _run_roundtable_task(client, task, context):
                 update_progress_card(client, card_msg_id, "🎙️ 圆桌会议进行中", body)
         elif event_type == "speech":
             stance_lines[payload["agent"]] = payload.get("stance", "中立")
-            reply_feishu_msg(client, msg_id, f"{payload['agent']}（{payload.get('stance','')}）：\n{payload['text']}")
         elif event_type == "round_end":
             context.progress(f"第 {payload['round']} 轮结束")
         elif event_type == "agent_error":
             context.progress(f"{payload['agent']} 暂时不可用，已移出本场后续轮次")
-            reply_feishu_msg(client, msg_id, f"⚠️ {payload['agent']} 暂时不可用：{payload['error'][:300]}")
 
-    result = RoundTableV2().run(topic, on_event=on_event, cancel_check=context.check_cancelled)
+    project = task["payload"].get("project")
+    memory_context = MEMORY_STORE.prompt_context(topic, project_name=project)
+    result = RoundTableV2().run(topic, on_event=on_event, cancel_check=context.check_cancelled,
+                                memory_context=memory_context)
     context.progress("会议纪要已生成")
     degraded = ""
     if result.get("unavailable_agents"):
@@ -408,25 +351,70 @@ def _run_roundtable_task(client, task, context):
     else:
         reply_feishu_msg(client, msg_id, f"🏁【会议完成】\n{result['final_summary']}")
     reply_feishu_msg(client, msg_id, f"📎 任务 {task['id']} · 纪要：roundtable/{result['session_id']}/minutes.md")
+    if project:
+        MEMORY_STORE.add(result["final_summary"], project_name=project, source_type="roundtable",
+                         source_id=task["id"], source_path=f"roundtable/{result['session_id']}/minutes.md")
     return {"session_id": result["session_id"], "rounds": result["rounds_used"], "summary": result["final_summary"], "unavailable_agents": result.get("unavailable_agents", {})}
 
 
 def _run_swarm_task(client, task, context):
     goal = task["payload"]["goal"]
     msg_id = task["message_id"]
-    context.progress("多智能体团队已开始协作")
+    project = task["payload"].get("project")
 
     def on_agent_speak(role_tag, message_text):
         context.progress(f"{role_tag} 已完成当前阶段")
-        reply_feishu_msg(client, msg_id, f"{role_tag}:\n{message_text}")
-
-    result = swarm_orchestrator.run_collaborative_project(
-        goal, on_agent_message=on_agent_speak, cancel_check=context.check_cancelled,
+    if task["phase"] == "planning":
+        context.progress("PM、架构师和探索员正在生成只读方案")
+        plan = swarm_orchestrator.plan_collaborative_project(
+            goal, project_name=project,
+            memory_context=MEMORY_STORE.prompt_context(goal, project_name=project),
+            on_agent_message=on_agent_speak, cancel_check=context.check_cancelled,
+        )
+        preview = (
+            f"**任务**：{task['id']}\n**项目**：{plan['project_name']}\n"
+            f"**目标**：{goal}\n\n**方案摘要**：\n{plan['requirements'][:500]}\n\n"
+            f"**影响与风险**：\n{plan['impact_and_risks'][:500]}\n\n"
+            f"⏳ 30 分钟内发送 `批准任务 {task['id']}`，或 `拒绝任务 {task['id']}`。"
+        )
+        send_progress_card(client, task["chat_id"], "🛂 写入预审", preview)
+        context.wait_for_approval(plan)
+    plan = task.get("plan")
+    if not plan or not task.get("approved_at"):
+        raise RuntimeError("缺少有效写入批准")
+    context.progress("已批准，Codex 正在独占写入工作区")
+    result = swarm_orchestrator.execute_collaborative_project(
+        plan, on_agent_message=on_agent_speak, cancel_check=context.check_cancelled,
     )
     if not result["success"]:
         raise RuntimeError("Codex 实现或验证失败，请查看阶段输出后重试")
-    reply_feishu_msg(client, msg_id, f"✅ 协作任务 {task['id']} 已完成，项目：{result['project_name']}")
+    reply_feishu_msg(client, msg_id, f"✅ 协作任务 {task['id']} 已完成，项目：{result['project_name']}\n\n{result['final_report'][:1000]}")
+    if project:
+        MEMORY_STORE.add(result["final_report"], project_name=project, source_type="swarm",
+                         source_id=task["id"], source_path=f"Obsidian/{result['project_name']}")
     return {"project_name": result["project_name"], "success": result["success"], "final_report": result["final_report"]}
+
+
+def _run_chat_task(client, task, context):
+    context.progress("Hermes 正在回复")
+    payload = task["payload"]
+    result = chat_with_hermes(task["user_id"], payload["prompt"], payload.get("project"))
+    record_task_event(task["id"], "agent_result", engine="hermes", ok=result.ok,
+                      error_code=result.error_code, duration_ms=result.duration_ms)
+    reply_feishu_msg(client, task["message_id"], result.text)
+    if not result.ok:
+        raise RuntimeError(f"Hermes {result.error_code}: {result.text[:300]}")
+    return {"reply": result.text}
+
+
+def _run_health_task(client, task, context):
+    context.progress("三条 Agent 通道正在并行探针")
+    results = deep_health_probe()
+    lines = [f"- {name}: {'✅' if result.ok else '❌'} {result.text[:120]} ({result.duration_ms}ms)"
+             for name, result in results.items()]
+    reply_feishu_msg(client, task["message_id"], "🩺【深度健康结果】\n" + "\n".join(lines))
+    return {name: {"ok": result.ok, "error_code": result.error_code,
+                   "duration_ms": result.duration_ms} for name, result in results.items()}
 
 
 def execute_background_task(client, task, context):
@@ -435,6 +423,10 @@ def execute_background_task(client, task, context):
             return _run_roundtable_task(client, task, context)
         if task["task_type"] == "swarm":
             return _run_swarm_task(client, task, context)
+        if task["task_type"] == "chat":
+            return _run_chat_task(client, task, context)
+        if task["task_type"] == "health_probe":
+            return _run_health_task(client, task, context)
         raise ValueError(f"未知任务类型: {task['task_type']}")
     except TaskCancelled:
         reply_feishu_msg(client, task["message_id"], f"🛑 任务 {task['id']} 已取消。")
@@ -467,10 +459,12 @@ def handle_message(client, data: P2ImMessageReceiveV1):
         lower_text = clean_text.lower()
 
         # 持久化任务控制命令
-        if lower_text in ["任务列表", "任务", "tasks", "task list"]:
-            tasks = TASK_CONTROLLER.store.list(chat_id_in, limit=10)
+        TASK_CONTROLLER.store.expire_approvals()
+        if lower_text in ["任务列表", "任务", "tasks", "task list", "任务列表 全部"]:
+            include_all = lower_text == "任务列表 全部"
+            tasks = TASK_CONTROLLER.store.list(chat_id_in, limit=10, include_all=include_all)
             body = "\n".join(f"- {_task_line(task)}" for task in tasks) if tasks else "暂无任务"
-            reply_feishu_msg(client, msg_id, f"📋【最近任务】\n{body}\n\n可用：任务 <ID>、取消任务 <ID>、重试任务 <ID>")
+            reply_feishu_msg(client, msg_id, f"📋【最近任务】\n{body}\n\n可用：任务 <ID>、取消任务 <ID>、重试任务 <ID>、任务列表 全部")
             return
 
         match = re.fullmatch(r"任务\s+([0-9a-f]{4,10})", lower_text)
@@ -484,6 +478,7 @@ def handle_message(client, data: P2ImMessageReceiveV1):
                 f"类型：{task['task_type']}",
                 f"状态：{TASK_STATUS_TEXT.get(task['status'], task['status'])}",
                 f"尝试次数：{task['attempt']}",
+                f"阶段：{task.get('phase') or 'execute'}",
                 f"进度：{task.get('progress') or '暂无'}",
             ]
             if task.get("error"):
@@ -503,6 +498,43 @@ def handle_message(client, data: P2ImMessageReceiveV1):
             old = TASK_CONTROLLER.store.find(match.group(1), chat_id_in)
             task = TASK_CONTROLLER.retry(old["id"], message_id=msg_id) if old else None
             reply_feishu_msg(client, msg_id, f"{'🔁 已创建重试任务：' + task['id'] if task else '仅失败、取消或已完成的唯一任务可以重试。'}")
+            return
+
+        match = re.fullmatch(r"批准任务\s+([0-9a-f]{4,10})", lower_text)
+        if match:
+            task = TASK_CONTROLLER.store.find(match.group(1), chat_id_in)
+            outcome = TASK_CONTROLLER.approve(task["id"]) if task else "not_found"
+            messages = {
+                "approved": f"✅ 已批准任务 {task['id']}，写入阶段已进入本会话队尾。",
+                "already_approved": f"ℹ️ 任务 {task['id']} 已批准，无需重复操作。" if task else "任务不存在。",
+                "not_waiting": "任务当前不在等待批准状态。",
+                "not_found": "未找到唯一匹配的任务。",
+            }
+            reply_feishu_msg(client, msg_id, messages[outcome])
+            return
+
+        match = re.fullmatch(r"拒绝任务\s+([0-9a-f]{4,10})", lower_text)
+        if match:
+            task = TASK_CONTROLLER.store.find(match.group(1), chat_id_in)
+            ok = bool(task and task["status"] == "waiting_approval" and TASK_CONTROLLER.store.request_cancel(task["id"]))
+            reply_feishu_msg(client, msg_id, f"{'🚫 已拒绝并取消任务 ' + task['id'] if ok else '任务不存在或不在等待批准状态。'}")
+            return
+
+        memory_command = parse_memory_command(clean_text)
+        if memory_command:
+            if memory_command["action"] == "remember":
+                memory = MEMORY_STORE.add(memory_command["content"], project_name=memory_command.get("project"),
+                                          source_type="manual", source_id=msg_id)
+                scope = f"项目 {memory['project_name']}" if memory["scope"] == "project" else "全局"
+                reply_feishu_msg(client, msg_id, f"🧠 已记住（{scope}）· ID {memory['id']}")
+            elif memory_command["action"] == "list_memories":
+                rows = MEMORY_STORE.list(memory_command.get("project"), limit=20)
+                body = "\n".join(f"- {row['id']} · {row['content'][:100]}" for row in rows) or "暂无记忆"
+                reply_feishu_msg(client, msg_id, f"🧠【记忆列表】\n{body}")
+            else:
+                memory = MEMORY_STORE.find(memory_command["id"])
+                ok = bool(memory and MEMORY_STORE.delete(memory["id"]))
+                reply_feishu_msg(client, msg_id, "🗑️ 已删除记忆。" if ok else "未找到唯一匹配的记忆 ID。")
             return
 
         # 0. 清空记忆/重置对话
@@ -545,6 +577,15 @@ def handle_message(client, data: P2ImMessageReceiveV1):
             now_str = time.strftime("%Y-%m-%d %H:%M:%S")
             counts = TASK_CONTROLLER.store.counts()
             active = counts.get("queued", 0) + counts.get("running", 0) + counts.get("waiting_approval", 0)
+            available = lightweight_health()
+            recent = {row["engine"]: row for row in engine_health()}
+            engine_lines = []
+            for name in ("hermes", "antigravity", "codex"):
+                row = recent.get(name) or {}
+                real = "尚无真实调用" if not row else (
+                    f"最近 {'成功' if row.get('available') else '失败/' + str(row.get('last_error_code') or 'unknown')} · {row.get('duration_ms') or 0}ms"
+                )
+                engine_lines.append(f"{'✅' if available[name] else '❌'} {name}: {real}")
             reply = (
                 f"📊【飞书多智能体协同工作室】\n"
                 f"⏰ 时间: {now_str}\n"
@@ -553,11 +594,17 @@ def handle_message(client, data: P2ImMessageReceiveV1):
                 f"📐 首席架构师:「反重力」(系统时序/接口设计)\n"
                 f"💻 核心工程师: Codex (受限工作区实现与测试)\n"
                 f"🫀 服务状态: 正常 | 活跃任务: {active} | 排队: {counts.get('queued', 0)} | 执行中: {counts.get('running', 0)}\n"
+                + "\n".join(engine_lines) + "\n"
                 f"-------------------------\n"
                 f"📂 知识中枢: Obsidian E:\\\\Obsidian_Vault\\\\多agent\\\\ (三级规范)\n"
                 f"💡 触发指令: 发送「开会 <议题>」召集圆桌讨论；「协作 <项目需求>」启动协同落地！"
             )
             reply_feishu_msg(client, msg_id, reply)
+            return
+
+        if lower_text == "深度健康":
+            task = TASK_CONTROLLER.submit("health_probe", chat_id_in, user_id, msg_id, {})
+            reply_feishu_msg(client, msg_id, f"✅ 已收到，深度健康任务 {task['id']} 已在后台排队。")
             return
 
         # 2. 圆桌会议模式：多Agent独立思考 + 开放式交流意见（V2 引擎：收敛循环+黑板+进度卡片）
@@ -572,10 +619,11 @@ def handle_message(client, data: P2ImMessageReceiveV1):
 
         if is_roundtable_trigger:
             # 提取议题：去掉开会类动词 + 开场白尾巴（"成员先做自我介绍"等）
+            tagged_text, project = extract_project_tag(clean_text)
             topic = re.sub(
                 r"^(开始|现在|大家|请|帮我|我们)?\s*(开会|圆桌|讨论|头脑风暴)\s*[:：]?\s*",
                 "",
-                clean_text,
+                tagged_text,
             ).strip()
             topic = re.sub(r"(成员|大家|各位|先)?\s*(做?自我介绍|打招呼|报到|集合)\s*$", "", topic).strip()
             # 议题太短（<4字）时自动补全为可讨论的完整议题
@@ -590,9 +638,9 @@ def handle_message(client, data: P2ImMessageReceiveV1):
                 topic = "（未指定议题，请各位自由讨论当前重要事项）"
 
             task = TASK_CONTROLLER.submit(
-                "roundtable", chat_id_in, user_id, msg_id, {"topic": topic},
+                "roundtable", chat_id_in, user_id, msg_id, {"topic": topic, "project": project},
             )
-            reply_feishu_msg(client, msg_id, f"🎙️ 圆桌任务已排队：{task['id']}\n发送「任务 {task['id']}」查看进度，或「取消任务 {task['id']}」。")
+            reply_feishu_msg(client, msg_id, f"✅ 已收到。圆桌任务已排队：{task['id']}\n发送「任务 {task['id']}」查看进度，或「取消任务 {task['id']}」。")
             return
 
         # 2. 触发多智能体全员协同研讨与落地模式 (Swarm Mode)
@@ -608,27 +656,33 @@ def handle_message(client, data: P2ImMessageReceiveV1):
         )
 
         if is_swarm_trigger:
-            task_goal = re.sub(r"^(协作|开工|项目|团队)\s*", "", clean_text).strip()
+            tagged_text, project = extract_project_tag(clean_text)
+            task_goal = re.sub(r"^(协作|开工|项目|团队)\s*", "", tagged_text).strip()
             if not task_goal:
                 reply_feishu_msg(client, msg_id, "请在「协作」后写明具体目标，例如：协作 为项目增加健康检查。")
                 return
             task = TASK_CONTROLLER.submit(
-                "swarm", chat_id_in, user_id, msg_id, {"goal": task_goal},
+                "swarm", chat_id_in, user_id, msg_id, {"goal": task_goal, "project": project},
             )
-            reply_feishu_msg(client, msg_id, f"🚀 协作任务已排队：{task['id']}\n发送「任务 {task['id']}」查看进度，或「取消任务 {task['id']}」。")
+            reply_feishu_msg(client, msg_id, f"✅ 已收到。协作任务只读规划已排队：{task['id']}\n规划完成后需再次批准才会写入。")
             return
 
-        # 3. 默认 Hermes 主脑管家对话（原 DeepSeek 管家已替换）
-        res = chat_with_hermes(user_id, clean_text)
-        reply_feishu_msg(client, msg_id, res)
+        # 3. 普通对话也持久化并后台执行，先确认接收。
+        prompt, project = extract_project_tag(clean_text)
+        task = TASK_CONTROLLER.submit("chat", chat_id_in, user_id, msg_id,
+                                      {"prompt": prompt, "project": project})
+        reply_feishu_msg(client, msg_id, f"✅ 已收到（任务 {task['id']}），Hermes 将在后台回复。")
 
 
 def main():
     cfg = load_config()
+    warnings = validate_startup(cfg)
     app_id = cfg["feishu"]["app_id"]
     app_secret = cfg["feishu"]["app_secret"]
 
     print("==================================================")
+    for warning in warnings:
+        print(f"[Degraded Startup] {warning}")
     print("🚀 正在启动飞书 多智能体协同工作室网关 (Swarm + Obsidian)...")
     print("==================================================")
     load_histories()  # 恢复对话历史（重启不丢）

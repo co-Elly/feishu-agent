@@ -1,8 +1,9 @@
 import os
 import json
 import time
+from settings import runtime_value
 
-VAULT_BASE = r"E:\Obsidian_Vault\多agent"
+VAULT_BASE = runtime_value("obsidian_vault")
 
 
 class ObsidianBridge:
