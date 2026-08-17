@@ -55,14 +55,26 @@ def test_restart_requeues_running_task(tmp_path, monkeypatch):
     assert recovered["progress"] == "服务重启后恢复排队"
 
 
-def test_restart_fails_non_idempotent_swarm_task(tmp_path, monkeypatch):
+def test_restart_replays_swarm_planning_task(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     task = store.create("swarm", "chat", "user", "msg", {"goal": "有副作用"})
+    assert store.claim(task["id"])
+    assert store.recover() == [task["id"]]
+    recovered = store.get(task["id"])
+    assert recovered["status"] == "queued"
+
+
+def test_restart_fails_approved_swarm_write(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    task = store.create("swarm", "chat", "user", "msg", {"goal": "有副作用"})
+    assert store.claim(task["id"])
+    assert store.wait_for_approval(task["id"], {"project_name": "p"})
+    assert store.approve(task["id"]) == "approved"
     assert store.claim(task["id"])
     assert store.recover() == []
     recovered = store.get(task["id"])
     assert recovered["status"] == "failed"
-    assert "use retry" in recovered["error"]
+    assert "manual retry" in recovered["error"]
 
 
 def test_retry_clones_terminal_task(tmp_path, monkeypatch):

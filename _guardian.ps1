@@ -7,16 +7,14 @@ if (-not $mutex.WaitOne(0, $false)) {
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
-$env:FEISHU_CODEX_COMMAND = "E:\feishu-agent\.tools\node_modules\.bin\codex.cmd"
 $userOpenAIKey = [Environment]::GetEnvironmentVariable("OPENAI_API_KEY", "User")
 if (-not [string]::IsNullOrWhiteSpace($userOpenAIKey)) {
     $env:OPENAI_API_KEY = $userOpenAIKey
 }
 $env:FEISHU_MAX_WORKERS = "4"
-$env:FEISHU_TASK_WORKERS = "2"
 $env:PYTHONIOENCODING = "utf-8"
 $pythonExe = "F:\anaconda\python.exe"
-$projectDir = "E:\feishu-agent"
+$projectDir = $PSScriptRoot
 $logPath = Join-Path $projectDir "bot_service_v2.log"
 
 while ($true) {

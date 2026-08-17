@@ -1,29 +1,25 @@
-# 飞书多智能体协同工作室
+# 飞书多智能体协同工作站
 
-通过飞书消息调用 Hermes、反重力和 Codex，支持普通对话、收敛式圆桌会议、项目协作及 Obsidian 归档。
+单机 Python + SQLite + 本地 CLI + 飞书架构。通过飞书调用 Hermes、反重力和 Codex，支持持久普通对话、收敛式圆桌、二次审批协作与严格作用域长期记忆。
 
-## 成员
+## 核心结构
 
-- Hermes：产品经理、主持与日常对话。
-- 反重力：架构设计与技术选型。
-- Codex：受限工作区内的代码实现、测试和问题排查。
+- `bot.py`：飞书 WebSocket 入口、命令路由、确认回复和进度卡。
+- `settings.py`：唯一配置入口、启动校验和日志脱敏。
+- `agent_runtime.py`：三个本地 Agent 的统一进程运行时、错误分类和健康记录。
+- `task_manager.py`：SQLite 持久任务、同会话 FIFO、跨会话并行、审批和恢复。
+- `swarm_orchestrator.py`：只读规划、批准后执行与 Obsidian 回写。
+- `roundtable_engine.py`：圆桌收敛、成员故障隔离、黑板和纪要。
+- `memory_store.py`：全局/项目严格隔离的 FTS5 长期记忆。
+- `control_store.py`：Agent 健康状态与结构化任务审计事件。
+- `conversation_store.py`：对话历史和飞书消息去重。
+- `workspace/`、`roundtable/`：运行数据；均不纳入 Git。
 
-旧 DeepSeek Harness“小d”已从运行时代码中移除。历史会议档案不会被改写。
+## 配置与启动
 
-## 目录结构
+复制 `config.example.json` 为不纳入 Git 的 `config.json`。飞书凭据缺失会阻止启动；单个 Agent 配置异常只会使该通道降级。
 
-- `bot.py`：飞书 WebSocket 入口、消息路由与回复。
-- `roundtable_engine.py`：圆桌编排、收敛判断、纪要和会议状态。
-- `swarm_orchestrator.py`：项目协作流程与 Obsidian 回写。
-- `agent_runtime.py`：Codex 进程适配与 CLI 任务书临时文件管理。
-- `conversation_store.py`、`task_manager.py`：SQLite 对话与后台任务状态。
-- `tests/`：可离线运行的回归测试。
-- `workspace/`：任务快照、SQLite 数据库及历史调试产物归档。
-- `roundtable/`：会议黑板、成员记忆、完整发言和纪要。
-- `.tools/`：机器人服务使用的本地 CLI 工具。
-- `启动飞书管家.bat`、`启动飞书管家_静默.vbs`、`_guardian.ps1`：常驻启动与崩溃恢复。
-
-## 安装与启动
+`runtime` 段统一配置 Obsidian 路径、反重力脚本、Codex/Hermes 命令、审批时限和任务并发数。若需临时覆盖 Codex 命令，可设置 `FEISHU_CODEX_COMMAND`。
 
 ```powershell
 python -m venv .venv
@@ -32,36 +28,39 @@ python -m pip install -r requirements.txt
 python bot.py
 ```
 
-本机还需要可用的 Hermes、反重力和 Codex CLI。若 `codex` 不在服务账户的 `PATH` 中，设置：
+现有 `启动飞书管家.bat`、`启动飞书管家_静默.vbs` 和 `_guardian.ps1` 保持原启动方式并负责崩溃恢复。
+
+## 调度与审批
+
+所有普通聊天、圆桌、协作和深度健康均进入持久任务系统，并先回复“已收到”。同一 `chat_id` 严格 FIFO，不同会话并行。等待审批任务不占会话执行槽；批准后进入该会话队尾。
+
+协作分两阶段：PM、架构师和探索员只读生成预审方案；只有收到 `批准任务 <ID>` 后，Codex 才获得 `workspace-write` 权限。所有工作区写入共用一把全局锁。审批默认 30 分钟过期。
+
+重启时，普通任务和规划阶段安全重放，等待审批保持等待；已进入写入阶段的任务标记失败，要求人工重试。
+
+## 飞书命令
+
+- 任务：`任务列表`、`任务列表 全部`、`任务 <ID>`、`取消任务 <ID>`、`重试任务 <ID>`。
+- 审批：`批准任务 <ID>`、`拒绝任务 <ID>`。
+- 健康：`健康`只做命令/脚本检查并展示最近真实调用；`深度健康`后台并行运行三条轻量探针。
+- 记忆：`记住 <内容>`、`记住 [项目:名称] <内容>`、`记忆列表`、`记忆列表 [项目:名称]`、`忘记 <ID>`。
+- 工作：`开会 [项目:名称] <议题>`、`协作 [项目:名称] <目标>`。
+
+未带 `[项目:名称]` 时只检索最多 3 条全局记忆，绝不读取项目记忆；带标签时额外检索最多 5 条该项目记忆。只有带项目标签的成功圆桌和协作结论自动写入项目记忆，并保存任务/会议来源。普通聊天不自动保存长期记忆。
+
+## 数据与审计
+
+- `workspace/conversations.db`：对话、消息去重、任务、`engine_health`、`task_events`、长期记忆和 FTS 索引。
+- `roundtable/roundtable.db`：会议、turn 和幂等缓存，继续独立保存。
+- `workspace/tasks/<ID>/task.json`：可读任务快照，包含阶段、审批方案和结果。
+- `task_events` 只记录状态迁移、Agent 结果类别与耗时，不记录密钥或完整 Prompt。
+
+迁移使用 `CREATE IF NOT EXISTS` 和按列检查的 `ALTER TABLE`，不会重建或清空现有表。数据库迁移前备份位于忽略提交的 `workspace/backups/`。
+
+## 测试与安全边界
 
 ```powershell
-$env:FEISHU_CODEX_COMMAND = "完整的 Codex CLI 命令"
+python -m pytest -q
 ```
 
-其他运行参数：
-
-- `FEISHU_MAX_WORKERS`：全局任务并发上限，默认 4；同一飞书会话始终串行。
-- Codex 圆桌发言使用只读沙箱；只有明确的“协作/开发”任务才使用工作区写权限。
-
-## 数据与恢复
-
-- 对话历史保存在 `workspace/conversations.db`，首次启动会自动导入旧 `chat_history.json`。
-- 飞书 `message_id` 会持久化去重，记录保留 7 天。
-- 长任务保存在同一 SQLite 的 `tasks` 表；每个任务另有 `workspace/tasks/<任务ID>/task.json` 快照。
-- 服务重启后，排队任务和可安全重放的圆桌任务自动恢复；可能修改文件的协作任务会标记失败，需人工发送“重试任务 <ID>”，避免重复副作用。
-- 圆桌状态、纪要和 Agent 记忆位于 `roundtable/`。
-- 运行数据、聊天日志、数据库和真实配置均已加入 `.gitignore`。
-
-## 测试
-
-```powershell
-python -m pytest tests -q
-```
-
-飞书任务命令：`任务列表`、`任务 <ID>`、`取消任务 <ID>`、`重试任务 <ID>`、`健康`。
-
-圆桌采用动态法定人数：首轮并行调用成员，失败成员立即熔断并退出后续轮次；至少保留两名有效成员才继续，否则任务快速失败。额度错误会按服务返回的恢复时间熔断，避免重复等待和扣费。
-
-## 当前安全边界
-
-三个本地 Agent 均通过参数数组启动，不使用 `shell=True`。项目协作允许 Codex 写入当前工作区；圆桌讨论只允许只读访问。
+三个本地 Agent 均使用参数数组启动，不使用 `shell=True`。网络故障最多重试一次，401 等认证错误不重试。圆桌只更新一张进度卡；单 Agent 故障会退出本场，其余成员满足法定人数时继续。

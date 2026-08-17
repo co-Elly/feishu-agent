@@ -12,7 +12,8 @@ def test_codex_uses_read_only_and_no_shell(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="完成", stderr="")
 
     monkeypatch.setattr(agent_runtime.subprocess, "run", fake_run)
-    assert agent_runtime.call_codex("检查项目") == "完成"
+    result = agent_runtime.call_codex("检查项目")
+    assert result.ok and result.text == "完成"
     assert "read-only" in captured["command"]
     assert captured["shell"] is False
     assert captured["input"] == "检查项目"
