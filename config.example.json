@@ -1,0 +1,14 @@
+{
+  "feishu": {
+    "app_id": "${FEISHU_APP_ID}",
+    "app_secret": "${FEISHU_APP_SECRET}"
+  },
+  "deepseek": {
+    "api_key": "${DEEPSEEK_API_KEY}",
+    "model": "deepseek-chat"
+  },
+  "gemini": {
+    "api_key": "${GEMINI_API_KEY}",
+    "model": "gemini-2.5-flash"
+  }
+}
