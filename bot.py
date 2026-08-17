@@ -397,8 +397,9 @@ def _run_swarm_task(client, task, context):
 
     def on_agent_speak(role_tag, message_text):
         context.progress(f"{role_tag} 已完成当前阶段")
+        record_task_event(task["id"], "agent_stage_completed", details={"role": role_tag})
     if task["phase"] == "planning":
-        context.progress("PM、架构师和探索员正在生成只读方案")
+        context.progress("Hermes PM → 反重力架构师 → Codex 只读探索，正在生成方案")
         plan = swarm_orchestrator.plan_collaborative_project(
             goal, project_name=project,
             memory_context=MEMORY_STORE.prompt_context(goal, project_name=project),
@@ -415,7 +416,7 @@ def _run_swarm_task(client, task, context):
     plan = task.get("plan")
     if not plan or not task.get("approved_at"):
         raise RuntimeError("缺少有效写入批准")
-    context.progress("已批准，Codex 正在独占写入工作区")
+    context.progress("已批准，反重力第一棒即将独占写入工作区")
     result = swarm_orchestrator.execute_collaborative_project(
         plan, on_agent_message=on_agent_speak, cancel_check=context.check_cancelled,
     )

@@ -5,7 +5,7 @@ import time
 
 import requests
 
-from agent_runtime import call_codex, call_hermes
+from agent_runtime import call_antigravity, call_codex, call_hermes
 from obsidian_bridge import obsidian_bridge
 from settings import load_config
 from task_manager import WORKSPACE_WRITE_LOCK
@@ -72,26 +72,37 @@ class MultiAgentSwarm:
         checkpoint()
         project_name = project_name or self._project_name(user_goal)
         background = f"\n\n{memory_context}" if memory_context else ""
-        pm = call_llm(
-            "你是产品经理，只做只读规划，不得修改文件。",
-            f"项目：{project_name}\n目标：{user_goal}{background}\n输出验收标准、范围和非目标。",
-        )
-        emit("👔 产品经理", pm)
-        checkpoint()
-        architecture = call_llm(
-            "你是首席架构师，只做只读设计，不得修改文件。",
-            f"项目：{project_name}\n目标：{user_goal}\nPM方案：{pm}{background}\n"
-            "输出最小架构、影响文件、数据迁移、风险和回退方案。",
-        )
-        emit("📐 架构师", architecture)
-        checkpoint()
-        scout_result = call_hermes(
-            f"你是只读探索员。项目【{project_name}】，目标：{user_goal}\n架构方案：{architecture}\n"
-            "只调查兼容性、可能遗漏和验证建议，不要修改任何文件。",
+        pm_result = call_hermes(
+            f"你是产品经理，只做只读规划，不得修改文件。\n项目：{project_name}\n"
+            f"目标：{user_goal}{background}\n输出验收标准、范围和非目标。",
             timeout=180,
         )
+        if not pm_result.ok:
+            raise RuntimeError(f"Hermes 规划失败：{pm_result.text}")
+        pm = pm_result.text
+        emit("👔 产品经理", pm)
+        checkpoint()
+        architecture_result = call_antigravity(
+            f"你是首席架构师，只做只读设计，不得修改文件。\n项目：{project_name}\n"
+            f"目标：{user_goal}\nPM方案：{pm}{background}\n"
+            "输出最小架构、影响文件、数据迁移、风险和回退方案。",
+            timeout=200, model="high",
+        )
+        if not architecture_result.ok:
+            raise RuntimeError(f"反重力架构规划失败：{architecture_result.text}")
+        architecture = architecture_result.text
+        emit("📐 架构师", architecture)
+        checkpoint()
+        scout_result = call_codex(
+            f"你是只读工程探索员。项目【{project_name}】，目标：{user_goal}\n"
+            f"PM方案：{pm}\n架构方案：{architecture}\n"
+            "检查当前工作区，只输出兼容性、影响文件、可能遗漏和验证建议，不要修改任何文件。",
+            timeout=300, writable=False,
+        )
+        if not scout_result.ok:
+            raise RuntimeError(f"Codex 只读探索失败：{scout_result.text}")
         scout = scout_result.text
-        emit("🔎 探索员", scout)
+        emit("🔎 Codex 只读探索", scout)
         checkpoint()
         return {
             "project_name": project_name,
@@ -110,36 +121,62 @@ class MultiAgentSwarm:
                 cancel_check()
 
         project_name, goal = plan["project_name"], plan["goal"]
-        implementation_prompt = (
-            "你是获批后的核心工程师。只在当前工作区内实现并测试以下方案；保留兼容性，"
-            "不得修改工作区外文件。完成后汇报改动文件、测试结果和剩余风险。\n\n"
+        first_pass_prompt = (
+            "你是获批后的第一棒执行工程师。请先在 E:\\feishu-agent 工作区实现以下方案并运行测试；"
+            "必须以真实文件、命令输出和测试结果为证据，不得只口头声称完成。不得修改工作区外文件。\n\n"
             f"项目：{project_name}\n目标：{goal}\nPM：{plan['requirements']}\n"
             f"架构：{plan['architecture']}\n探索：{plan['research']}"
         )
         with WORKSPACE_WRITE_LOCK:
             checkpoint()
-            result = call_codex(implementation_prompt, timeout=600, writable=True)
+            first_pass = call_antigravity(first_pass_prompt, timeout=600, model="high")
             if on_agent_message:
-                on_agent_message("💻 Codex", result.text)
+                on_agent_message("📐 反重力第一棒", first_pass.text)
+            if not first_pass.ok:
+                return {"project_name": project_name, "success": False, "final_report": first_pass.text}
+            checkpoint()
+            refine_prompt = (
+                "你是获批后的收尾工程师。反重力已完成第一版；请检查当前工作区的真实改动，"
+                "在其基础上补缺、升级并运行全量相关测试。不要无故推翻已验证的实现。"
+                "完成后汇报改动文件、测试命令、真实结果和剩余风险。\n\n"
+                f"项目：{project_name}\n目标：{goal}\n批准方案：{plan['architecture']}\n"
+                f"反重力交付：{first_pass.text}"
+            )
+            result = call_codex(refine_prompt, timeout=600, writable=True)
+            if on_agent_message:
+                on_agent_message("💻 Codex 收尾升级", result.text)
             if not result.ok:
                 return {"project_name": project_name, "success": False, "final_report": result.text}
             checkpoint()
+            validation = call_hermes(
+                "你是最终验收官，只读检查，不得修改任何文件。请根据批准方案、当前工作区和测试证据验收。"
+                "第一行必须严格写“验收：通过”或“验收：不通过”，随后列出证据和未解决问题。\n\n"
+                f"项目：{project_name}\n目标：{goal}\n批准方案：{plan['architecture']}\n"
+                f"反重力第一棒：{first_pass.text}\nCodex 收尾：{result.text}",
+                timeout=180,
+            )
+            if on_agent_message:
+                on_agent_message("👔 Hermes 最终验收", validation.text)
+            validation_lines = validation.text.strip().splitlines()
+            passed = bool(validation.ok and validation_lines and
+                          validation_lines[0].replace(":", "：").startswith("验收：通过"))
+            if not passed:
+                return {"project_name": project_name, "success": False, "final_report": validation.text}
             self.bridge.init_project(project_name, goal)
             self.bridge.write_architecture(project_name, (
                 f"# {project_name} · 需求与架构\n\n## 目标\n{goal}\n\n"
                 f"## 产品方案\n{plan['requirements']}\n\n## 架构与风险\n{plan['architecture']}\n"
             ))
             self.bridge.write_code_test(project_name, (
-                f"# {project_name} · 实现与测试\n\n## Codex 执行记录\n{result.text}\n\n"
+                f"# {project_name} · 实现与测试\n\n## 反重力第一棒\n{first_pass.text}\n\n"
+                f"## Codex 收尾升级\n{result.text}\n\n## Hermes 最终验收\n{validation.text}\n\n"
                 f"## 只读探索结论\n{plan['research']}\n"
             ))
-            self.bridge.append_decision_log(project_name, "写入方案经飞书二次批准后执行。")
-        final_report = call_llm(
-            "你是产品经理，精炼汇报已完成事项、测试和剩余风险。",
-            f"项目：{project_name}\n目标：{goal}\n执行结果：{result.text}",
-        )
+            self.bridge.append_decision_log(project_name, "写入方案经飞书二次批准后，按反重力第一棒、Codex 收尾、Hermes 验收执行。")
+        final_report = validation.text
         return {"project_name": project_name, "success": True,
-                "final_report": final_report, "implementation": result.text}
+                "final_report": final_report, "first_pass": first_pass.text,
+                "implementation": result.text, "validation": validation.text}
 
 
 swarm_orchestrator = MultiAgentSwarm()
