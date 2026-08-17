@@ -290,6 +290,48 @@ def update_progress_card(client, message_id, title, body_text):
     return resp.success()
 
 
+def send_feishu_file(client, chat_id, file_path, display_name=None):
+    """Upload a local artifact and send it as a clickable Feishu attachment."""
+    from lark_oapi.api.im.v1 import (
+        CreateFileRequest,
+        CreateFileRequestBody,
+        CreateMessageRequest,
+        CreateMessageRequestBody,
+    )
+    if not os.path.isfile(file_path):
+        return None
+    with open(file_path, "rb") as handle:
+        upload = client.im.v1.file.create(
+            CreateFileRequest.builder().request_body(
+                CreateFileRequestBody.builder()
+                .file_type("stream")
+                .file_name(display_name or os.path.basename(file_path))
+                .file(handle)
+                .build()
+            ).build()
+        )
+    if not upload.success():
+        print(f"[Feishu File Upload Error] code: {upload.code}, msg: {upload.msg}")
+        return None
+    request = (
+        CreateMessageRequest.builder()
+        .receive_id_type("chat_id")
+        .request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("file")
+            .content(json.dumps({"file_key": upload.data.file_key}))
+            .build()
+        ).build()
+    )
+    response = client.im.v1.message.create(request)
+    if not response.success():
+        print(f"[Feishu File Send Error] code: {response.code}, msg: {response.msg}")
+        return None
+    log_chat("out", "bot", f"[文件] {display_name or os.path.basename(file_path)}", chat_id)
+    return response.data.message_id
+
+
 TASK_STATUS_TEXT = {
     "queued": "排队中",
     "running": "执行中",
@@ -350,10 +392,16 @@ def _run_roundtable_task(client, task, context):
         update_progress_card(client, card_msg_id, "✅ 圆桌会议完成", final_body)
     else:
         reply_feishu_msg(client, msg_id, f"🏁【会议完成】\n{result['final_summary']}")
-    reply_feishu_msg(client, msg_id, f"📎 任务 {task['id']} · 纪要：roundtable/{result['session_id']}/minutes.md")
+    minutes_rel = f"roundtable/{result['session_id']}/minutes.md"
+    minutes_path = os.path.join(os.path.dirname(__file__), *minutes_rel.split("/"))
+    attachment = send_feishu_file(
+        client, chat_id, minutes_path, display_name=f"会议纪要-{task['id']}.md",
+    )
+    if not attachment:
+        reply_feishu_msg(client, msg_id, f"📎 任务 {task['id']} · 纪要：{minutes_rel}")
     if project:
         MEMORY_STORE.add(result["final_summary"], project_name=project, source_type="roundtable",
-                         source_id=task["id"], source_path=f"roundtable/{result['session_id']}/minutes.md")
+                         source_id=task["id"], source_path=minutes_rel)
     return {"session_id": result["session_id"], "rounds": result["rounds_used"], "summary": result["final_summary"], "unavailable_agents": result.get("unavailable_agents", {})}
 
 
