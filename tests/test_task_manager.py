@@ -107,3 +107,4 @@ def test_controller_executes_and_finishes(tmp_path, monkeypatch):
             break
         time.sleep(0.02)
     assert current["result"] == {"value": 1}
+    controller.shutdown()

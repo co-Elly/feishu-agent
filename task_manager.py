@@ -36,8 +36,12 @@ def _connect():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            raise
     conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY, task_type TEXT NOT NULL, status TEXT NOT NULL,
         chat_id TEXT NOT NULL, user_id TEXT, message_id TEXT,
@@ -317,6 +321,9 @@ class TaskController:
         if outcome == "approved":
             self._schedule_chat(self.store.get(task_id)["chat_id"])
         return outcome
+
+    def shutdown(self, wait=True):
+        self.executor.shutdown(wait=wait)
 
     def _schedule_chat(self, chat_id):
         with self._lock:

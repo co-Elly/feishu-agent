@@ -70,6 +70,7 @@ def test_same_chat_fifo(tmp_path, monkeypatch):
     release.set()
     assert _wait(store, [first["id"], second["id"]]) == ["succeeded", "succeeded"]
     assert order == [1, 2]
+    controller.shutdown()
 
 
 def test_different_chats_run_in_parallel(tmp_path, monkeypatch):
@@ -91,6 +92,7 @@ def test_different_chats_run_in_parallel(tmp_path, monkeypatch):
     assert both.wait(1)
     release.set()
     assert _wait(store, [a["id"], b["id"]]) == ["succeeded", "succeeded"]
+    controller.shutdown()
 
 
 def test_global_workspace_write_lock_serializes_writers():
