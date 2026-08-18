@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from functools import lru_cache
 import yaml
@@ -26,6 +27,7 @@ RUNTIME_DEFAULTS = {
     "antigravity_script_low": os.environ.get("FEISHU_ANTIGRAVITY_LOW", ""),
     "codex_command": "codex",
     "hermes_command": "hermes",
+    "test_command": f'"{sys.executable}" -m pytest',
     "approval_ttl_seconds": 1800,
     "task_workers": 4,
 }

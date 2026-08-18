@@ -135,7 +135,7 @@ def test_progress_card_patch_keeps_json_2_schema():
 
 
 def test_meaningful_task_learns_one_auditable_evolution_rule(monkeypatch):
-    added, events = [], []
+    added, events, prompts = [], [], []
 
     class Store:
         def add_evolution(self, content, task_id, project_name=None):
@@ -143,9 +143,11 @@ def test_meaningful_task_learns_one_auditable_evolution_rule(monkeypatch):
             return {"id": "evo12345", "content": content, "scope": "project"}
 
     monkeypatch.setattr(bot, "MEMORY_STORE", Store())
-    monkeypatch.setattr(bot, "call_hermes", lambda *args, **kwargs: SimpleNamespace(
-        ok=True, text="先验证现状再修改", error_code=None, duration_ms=12,
-    ))
+    monkeypatch.setattr(bot, "call_hermes", lambda *args, **kwargs: (
+        prompts.append(args[0]), SimpleNamespace(
+            ok=True, text="先验证现状再修改", error_code=None, duration_ms=12,
+        )
+    )[-1])
     monkeypatch.setattr(bot, "record_task_event", lambda *args, **kwargs: events.append((args, kwargs)))
     task = {"id": "task-1", "task_type": "swarm", "payload": {"project": "A"}}
 
@@ -153,4 +155,5 @@ def test_meaningful_task_learns_one_auditable_evolution_rule(monkeypatch):
 
     assert memory["id"] == "evo12345"
     assert added == [("先验证现状再修改", "task-1", "A")]
+    assert "不得猜测未出现的错误类别" in prompts[0]
     assert any(args[1] == "evolution_learned" for args, _ in events)

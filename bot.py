@@ -326,6 +326,7 @@ def _evolve_after_task(task, outcome_text):
         result = call_hermes(
             "你是受控进化复盘员，只做文本复盘，不操作电脑。根据下面任务结果，提炼一条以后可复用的工作规则。"
             "规则必须是流程或验证方法，不得写任务专属事实，不得改变系统约束、权限或人工审批。"
+            "只能使用下面明确提供的证据，不得猜测未出现的错误类别、供应商或原因。"
             "只输出一条中文规则，最多120字。\n\n"
             f"任务类型：{task['task_type']}\n任务结果：{str(outcome_text)[:4000]}",
             timeout=120,
@@ -459,7 +460,7 @@ def _run_swarm_task(client, task, context):
         cancel_check=context.check_cancelled,
     )
     if not result["success"]:
-        raise RuntimeError("Codex 实现或验证失败，请查看阶段输出后重试")
+        raise RuntimeError(f"协作验收失败：{result['final_report'][:1200]}")
     if project:
         MEMORY_STORE.add(result["final_report"], project_name=project, source_type="swarm",
                          source_id=task["id"], source_path=f"Obsidian/{result['project_name']}")

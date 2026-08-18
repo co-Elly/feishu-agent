@@ -7,7 +7,7 @@ import requests
 
 from agent_runtime import call_antigravity, call_codex, call_hermes
 from obsidian_bridge import obsidian_bridge
-from settings import load_config
+from settings import load_config, runtime_value
 from task_manager import WORKSPACE_WRITE_LOCK
 
 
@@ -132,9 +132,11 @@ class MultiAgentSwarm:
                 cancel_check()
 
         project_name, goal = plan["project_name"], plan["goal"]
+        test_command = runtime_value("test_command")
         first_pass_prompt = (
             "你是获批后的第一棒执行工程师。请先在 E:\\feishu-agent 工作区实现以下方案并运行测试；"
             "必须以真实文件、命令输出和测试结果为证据，不得只口头声称完成。不得修改工作区外文件。\n\n"
+            f"项目标准测试命令（必须原样使用）：{test_command}\n"
             f"项目：{project_name}\n目标：{goal}\nPM：{plan['requirements']}\n"
             f"架构：{plan['architecture']}\n探索：{plan['research']}"
         )
@@ -152,6 +154,7 @@ class MultiAgentSwarm:
                 "你是获批后的收尾工程师。反重力已完成第一版；请检查当前工作区的真实改动，"
                 "在其基础上补缺、升级并运行全量相关测试。不要无故推翻已验证的实现。"
                 "完成后汇报改动文件、测试命令、真实结果和剩余风险。\n\n"
+                f"项目标准全量测试命令（必须原样使用）：{test_command}\n"
                 f"项目：{project_name}\n目标：{goal}\n批准方案：{plan['architecture']}\n"
                 f"反重力交付：{first_pass.text}"
             )

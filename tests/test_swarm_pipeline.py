@@ -8,12 +8,17 @@ def _result(text):
 
 
 def test_approved_pipeline_runs_antigravity_then_codex_then_hermes(monkeypatch):
-    order = []
+    order, prompts = [], []
+
+    monkeypatch.setattr(swarm_orchestrator, "runtime_value",
+                        lambda name: '"F:\\anaconda\\python.exe" -m pytest')
 
     monkeypatch.setattr(swarm_orchestrator, "call_antigravity",
-                        lambda *args, **kwargs: order.append("antigravity") or _result("第一版完成"))
+                        lambda *args, **kwargs: (order.append("antigravity"), prompts.append(args[0]),
+                                                _result("第一版完成"))[-1])
     monkeypatch.setattr(swarm_orchestrator, "call_codex",
-                        lambda *args, **kwargs: order.append("codex") or _result("收尾和测试完成"))
+                        lambda *args, **kwargs: (order.append("codex"), prompts.append(args[0]),
+                                                _result("收尾和测试完成"))[-1])
     monkeypatch.setattr(swarm_orchestrator, "call_hermes",
                         lambda *args, **kwargs: order.append("hermes") or _result("验收：通过\n证据齐全"))
 
@@ -31,6 +36,7 @@ def test_approved_pipeline_runs_antigravity_then_codex_then_hermes(monkeypatch):
 
     assert result["success"] is True
     assert order == ["antigravity", "codex", "hermes"]
+    assert all('"F:\\anaconda\\python.exe" -m pytest' in prompt for prompt in prompts)
 
 
 def test_read_only_plan_uses_three_real_agent_channels(monkeypatch):
