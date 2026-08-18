@@ -88,6 +88,24 @@ def test_retry_clones_terminal_task(tmp_path, monkeypatch):
     assert retry["message_id"] == "new-msg"
 
 
+def test_retry_of_approved_swarm_reuses_plan_and_enters_execute(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    task = store.create("swarm", "chat", "user", "old-msg", {"goal": "重试写入"})
+    assert store.claim(task["id"])
+    plan = {"project_name": "p", "architecture": "approved"}
+    assert store.wait_for_approval(task["id"], plan)
+    assert store.approve(task["id"]) == "approved"
+    assert store.claim(task["id"])
+    store.finish(task["id"], "failed", error="agent failed")
+
+    retry = store.retry(task["id"], message_id="retry-msg")
+
+    assert retry["phase"] == "execute"
+    assert retry["plan"] == plan
+    assert retry["approved_at"] is not None
+    assert retry["status"] == "queued"
+
+
 def test_controller_executes_and_finishes(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     done = threading.Event()

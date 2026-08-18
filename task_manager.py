@@ -88,7 +88,8 @@ def _write_snapshot(task):
 
 
 class TaskStore:
-    def create(self, task_type, chat_id, user_id, message_id, payload, retry_of=None, attempt=1, phase=None):
+    def create(self, task_type, chat_id, user_id, message_id, payload, retry_of=None, attempt=1,
+               phase=None, plan=None, approved_at=None):
         task_id, now = uuid.uuid4().hex[:10], time.time()
         work_dir = os.path.join(WORK_ROOT, task_id)
         os.makedirs(work_dir, exist_ok=False)
@@ -96,10 +97,11 @@ class TaskStore:
         with _connect() as conn:
             conn.execute("""INSERT INTO tasks(
                 id, task_type, status, chat_id, user_id, message_id, payload_json,
-                work_dir, retry_of, attempt, created_at, updated_at, phase
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                work_dir, retry_of, attempt, created_at, updated_at, phase, plan_json, approved_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (task_id, task_type, "queued", chat_id, user_id, message_id,
-             json.dumps(payload, ensure_ascii=False), work_dir, retry_of, attempt, now, now, phase))
+             json.dumps(payload, ensure_ascii=False), work_dir, retry_of, attempt, now, now, phase,
+             json.dumps(plan, ensure_ascii=False) if plan is not None else None, approved_at))
         record_task_event(task_id, "created", to_status="queued", details={"task_type": task_type, "phase": phase})
         task = self.get(task_id)
         _write_snapshot(task)
@@ -244,8 +246,17 @@ class TaskStore:
         old = self.get(task_id)
         if not old or old["status"] not in TERMINAL_STATES:
             return None
-        return self.create(old["task_type"], old["chat_id"], old["user_id"], message_id or old["message_id"],
-                           old["payload"], retry_of=old["id"], attempt=old["attempt"] + 1)
+        reuse_approval = bool(old["task_type"] == "swarm" and old.get("approved_at") and old.get("plan"))
+        retry = self.create(
+            old["task_type"], old["chat_id"], old["user_id"], message_id or old["message_id"],
+            old["payload"], retry_of=old["id"], attempt=old["attempt"] + 1,
+            phase="execute" if reuse_approval else None,
+            plan=old["plan"] if reuse_approval else None,
+            approved_at=time.time() if reuse_approval else None,
+        )
+        if reuse_approval:
+            record_task_event(retry["id"], "retry_reused_approval", details={"source_task_id": old["id"]})
+        return retry
 
     def recover(self):
         self.expire_approvals()
