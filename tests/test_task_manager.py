@@ -106,6 +106,19 @@ def test_retry_of_approved_swarm_reuses_plan_and_enters_execute(tmp_path, monkey
     assert retry["status"] == "queued"
 
 
+def test_default_list_hides_only_successful_chat_tasks(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    chat = store.create("chat", "chat", "user", "m1", {"prompt": "你好"})
+    swarm = store.create("swarm", "chat", "user", "m2", {"goal": "改造"})
+    assert store.claim(chat["id"])
+    store.finish(chat["id"], "succeeded", result={})
+    assert store.claim(swarm["id"])
+    store.finish(swarm["id"], "succeeded", result={})
+
+    assert [task["id"] for task in store.list("chat")] == [swarm["id"]]
+    assert {task["id"] for task in store.list("chat", include_all=True)} == {chat["id"], swarm["id"]}
+
+
 def test_controller_executes_and_finishes(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     done = threading.Event()
