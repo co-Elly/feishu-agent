@@ -21,11 +21,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from agent_runtime import AgentResult, call_antigravity, call_codex, call_hermes, cooldown_seconds
 from task_manager import TaskCancelled
+from settings import get_agents_config, get_summary_config, format_summary_prompt, resolve_style, render_prompt
 
 # ---------------------------------------------------------------- 路径与 DB
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RT_ROOT = os.path.join(BASE_DIR, "roundtable")
-DB_PATH = os.path.join(RT_ROOT, "roundtable.db")
+RT_ROOT = os.path.abspath(os.environ.get("FEISHU_ROUNDTABLE_ROOT", os.path.join(BASE_DIR, "roundtable")))
+DB_PATH = os.path.abspath(os.environ.get("FEISHU_ROUNDTABLE_DB", os.path.join(RT_ROOT, "roundtable.db")))
 
 # 黑板上板：每个会议一个目录
 def session_dir(session_id):
@@ -224,27 +225,8 @@ def pending_turns(session_id, round_no):
     conn.close()
     return [dict(r) for r in rows]
 
-# ---------------------------------------------------------------- 团队配置
-AGENTS = {
-    "pm": {
-        "name": "👔 产品经理·Hermes",
-        "engine": "hermes",  # 真实 Hermes（主脑真身）
-        "role": "你是产品经理兼会议主持人（Hermes 主脑真身）。你负责：把控讨论方向、评估意见、推动共识、最后向老板汇报。你关注需求价值、用户视角与落地优先级。",
-        "style": "言简意赅，善于总结和引导。",
-    },
-    "arch": {
-        "name": "📐 反重力·架构师",
-        "engine": "antigravity",  # 真实 agy CLI（桌面端 Google AI Pro 额度）
-        "role": "你是一位首席系统架构师（代号反重力）。你负责：系统架构、数据流、模块划分、接口契约与技术选型。你关注高内聚低耦合、可扩展性与工程可行性。",
-        "style": "结构化表达，给出模块/接口层面的专业意见。",
-    },
-    "dev": {
-        "name": "💻 Codex·核心工程师",
-        "engine": "codex",
-        "role": "你是 Codex 核心工程师。你负责代码实现方案、可运行性、性能、安全与测试验证。",
-        "style": "给出可落地的技术方案与实现要点。",
-    },
-}
+# ---------------------------------------------------------------- 团队配置（支持 config.json 动态配置与风格预设）
+AGENTS = get_agents_config()
 # 圆桌参会阵容：Hermes + 反重力 + Codex
 ORDER = ["pm", "arch", "dev"]
 MAX_ROUNDS = 4  # 收敛兜底（简单议题可在 2 轮收敛）
@@ -550,31 +532,18 @@ class RoundTableV2:
             return f"【{agent['name']}】发言异常: {str(e)}"
 
     # ---- 单 Agent 发言（第 2 轮起串行：看到黑板）
-    def _speak(self, agent_key, topic, session_id, round_no, board_summary, my_memory, stage, on_event=None, topic_context=""):
+    def _speak(self, agent_key, topic, session_id, round_no, board_summary, my_memory, stage, on_event=None, topic_context="", override=None):
         agent = AGENTS[agent_key]
-        memory_text = my_memory if my_memory else "（暂无历史发言）"
-        ctx_block = f"{topic_context}\n\n" if topic_context else ""
-        prompt = (
-            f"【会议主题】{topic}\n\n"
-            f"{ctx_block}"
-            f"【本次讨论目标】围绕上述主题，从你的专业身份视角给出结构化专业意见。"
-            f"⚠️ 这是真实工作议题，发言必须落在事实上：历史线索只能用于定位，不得直接当成本场现状；"
-            f"只有本场黑板或实时查证确认的信息才能称为当前事实。禁止空谈通用流程、泛泛架构或反问澄清。\n\n"
-            f"【黑板上板·其他成员发言摘要】\n{board_summary or '（第一轮独立发言，你无需参考他人）'}\n\n"
-            f"【你的本场个人记忆·此前发言】\n{memory_text}\n\n"
-            f"【你的身份】{agent['role']}\n"
-            f"【当前轮次】第 {round_no} 轮\n{stage}\n"
-            f"【发言要求】{agent['style']} 输出格式：\n"
-            f"第一行写「立场：同意/补充/反对/弃权」\n"
-            f"然后给出你的专业意见（≤180字）。只输出发言内容本身，不要思考过程。"
-        )
-        # Codex 在圆桌中仅做只读分析，不直接修改项目。
-        if agent["engine"] == "codex":
-            prompt += (
-                "\n\n⚠️ 特别注意：你收到的【会议主题】已经是明确的讨论议题，请直接给出你的专业意见，"
-                "绝对不要反问、不要要求澄清、不要列问题选项、不要要求补充信息。"
-                "你的角色是参与圆桌讨论的工程师，不是需求分析师。"
-            )
+        style_override = override or getattr(self, "style_overrides", {}).get(agent_key)
+        ctx = {
+            "topic": topic,
+            "topic_context": topic_context,
+            "round_no": round_no,
+            "stage": stage,
+            "board_summary": board_summary,
+            "my_memory": my_memory,
+        }
+        prompt = render_prompt(agent_key, ctx, override=style_override)
         # 议题重要性 → 反重力模型档位（重要议题 pro-high，日常 pro-low）
         antigravity_model = "high" if topic_is_important(topic) else "low"
         reply = self._execute_speech(agent_key, session_id, round_no, prompt, antigravity_model)
@@ -582,24 +551,35 @@ class RoundTableV2:
         if len(reply) > 400:
             artifact_name = f"r{round_no}_{agent_key}.md"
             artifact_path = os.path.join(session_dir(session_id), "artifacts", artifact_name)
+            ensure_dir(os.path.dirname(artifact_path))
             with open(artifact_path, "w", encoding="utf-8") as f:
                 f.write(f"# {agent['name']} 第{round_no}轮完整发言\n\n{reply}\n")
             reply_brief = reply[:400] + f"\n\n📎 [完整产物已存档: artifacts/{artifact_name}]"
             # 个人记忆存完整版
             mem_path = os.path.join(session_dir(session_id), "memories", f"{agent_key}.md")
+            ensure_dir(os.path.dirname(mem_path))
             with open(mem_path, "a", encoding="utf-8") as f:
                 f.write(f"\n## 第{round_no}轮 ({time.strftime('%H:%M:%S')})\n{reply}\n")
             return reply_brief
         # 追加到个人记忆
         mem_path = os.path.join(session_dir(session_id), "memories", f"{agent_key}.md")
+        ensure_dir(os.path.dirname(mem_path))
         with open(mem_path, "a", encoding="utf-8") as f:
             f.write(f"\n## 第{round_no}轮 ({time.strftime('%H:%M:%S')})\n{reply}\n")
         return reply
 
     # ---- 主流程
-    def run(self, topic, on_event=None, cancel_check=None, memory_context=""):
+    def run(self, topic, on_event=None, cancel_check=None, memory_context="", style_overrides=None):
         """主持一场收敛式圆桌讨论；on_event(msg_type, payload) 供飞书播报"""
-        # 断点续跑：回收上次崩溃遗留的 running 任务（幂等缓存保证不重复执行）
+        global AGENTS
+        AGENTS = get_agents_config()
+        if isinstance(style_overrides, str):
+            self.style_overrides = {k: style_overrides for k in ORDER}
+        elif isinstance(style_overrides, dict):
+            self.style_overrides = dict(style_overrides)
+        else:
+            self.style_overrides = {}
+        # 断点续跑：回收上次崩溃遗留的 running 任务（幂点缓存保证不重复执行）
         reclaim_stale(running_timeout=600, session_timeout=3600)
         # 先预研再创建本场，避免把刚创建的 running session 误认成历史会议。
         topic_ctx = research_topic(topic)
@@ -646,7 +626,7 @@ class RoundTableV2:
                     results = {}
                     with ThreadPoolExecutor(max_workers=len(current_order)) as ex:
                         futures = {
-                            ex.submit(self._speak, k, topic, session_id, 1, "", "", stage, on_event, topic_context=topic_ctx): k
+                            ex.submit(self._speak, k, topic, session_id, 1, "", "", stage, on_event, topic_context=topic_ctx, override=self.style_overrides.get(k)): k
                             for k in current_order
                         }
                         for fut in futures:
@@ -673,7 +653,7 @@ class RoundTableV2:
                         futures = {}
                         for k in current_order:
                             mem_text = self._read_memory(session_id, k)
-                            futures[ex.submit(self._speak, k, topic, session_id, round_no, prev_summary, mem_text, stage, on_event, topic_context=topic_ctx)] = k
+                            futures[ex.submit(self._speak, k, topic, session_id, round_no, prev_summary, mem_text, stage, on_event, topic_context=topic_ctx, override=self.style_overrides.get(k))] = k
                         for fut in futures:
                             results[futures[fut]] = fut.result()
                     if cancel_check:
@@ -810,19 +790,16 @@ class RoundTableV2:
         from swarm_orchestrator import call_llm
         self._calls += 1  # 总结陈词计一次 LLM 调用
         members_str = "、".join(AGENTS[k]["name"] for k in ORDER)
-        summary_prompt = (
-            f"你是会议主持人。刚才 {len(ORDER)} 位成员（{members_str}）就【{topic}】完成了圆桌讨论，最终发言如下：\n"
-            f"{all_views}\n\n"
-            f"请向老板（人类CEO）做**最终总结陈词**：\n"
-            f"1. 共识点（大家一致认可什么）\n"
-            f"2. 分歧点（哪里还有不同意见，各是什么立场）\n"
-            f"3. 你的裁决建议（作为主持人，你推荐怎么推进）\n"
-            f"4. 抛给老板 2 个关键决策问题（让老板做选择）\n"
-            f"历史记录和成员推测只能标为待验证；没有本场证据的旧错误，不得写成当前已确认故障。\n"
-            f"控制在 300 字以内，结构清晰。"
+        summary_cfg = get_summary_config()
+        summary_prompt = format_summary_prompt(
+            summary_cfg["template"],
+            agent_count=len(ORDER),
+            members=members_str,
+            topic=topic,
+            all_views=all_views,
         )
         summary = call_llm(
-            "你是高效果断的产品经理兼会议主持人，善于总结共识、暴露分歧、让老板做选择题。",
+            summary_cfg["system"],
             summary_prompt,
             model="deepseek-chat",
         )

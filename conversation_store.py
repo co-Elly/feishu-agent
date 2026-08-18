@@ -8,7 +8,9 @@ import time
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "workspace", "conversations.db")
+DB_PATH = os.path.abspath(os.environ.get(
+    "FEISHU_DB_PATH", os.path.join(BASE_DIR, "workspace", "conversations.db"),
+))
 LEGACY_PATH = os.path.join(BASE_DIR, "chat_history.json")
 _LOCK = threading.RLock()
 

@@ -98,6 +98,25 @@ def test_minutes_card_uses_clickable_collapsible_panel(monkeypatch):
     assert panel["elements"][0]["content"] == "# 完整内容"
 
 
+def test_progress_card_patch_keeps_json_2_schema():
+    captured = {}
+
+    class Response:
+        code, msg = 0, ""
+        def success(self): return True
+
+    class MessageApi:
+        def patch(self, request):
+            captured["message"] = request.body
+            return Response()
+
+    client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=MessageApi())))
+    assert bot.update_progress_card(client, "message-id", "进度", "已完成")
+    card = json.loads(captured["message"].content)
+    assert card["schema"] == "2.0"
+    assert card["body"]["elements"] == [{"tag": "markdown", "content": "已完成"}]
+
+
 def test_meaningful_task_learns_one_auditable_evolution_rule(monkeypatch):
     added, events = [], []
 

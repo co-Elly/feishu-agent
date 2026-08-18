@@ -1,5 +1,6 @@
 lark-oapi>=1.4,<2
 requests>=2.31,<3
+PyYAML>=6,<7
 
 # Development
 pytest>=8,<10

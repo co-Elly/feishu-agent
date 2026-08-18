@@ -27,7 +27,7 @@ from agent_runtime import call_hermes, deep_health_probe, lightweight_health
 from command_parser import extract_project_tag, parse_memory_command
 from control_store import engine_health, record_task_event
 from memory_store import MemoryStore
-from settings import load_config, runtime_value, validate_startup
+from settings import load_config, redact, runtime_value, validate_startup
 from task_manager import TaskCancelled, TaskController
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -57,7 +57,7 @@ def log_chat(direction, user, msg, chat_id=None):
                         "dir": direction,          # in=用户发来 / out=bot发出
                         "user": user or "unknown",
                         "chat_id": chat_id or "",
-                        "msg": (msg or "")[:500],
+                        "msg": redact(str(msg or ""))[:500],
                     },
                     ensure_ascii=False,
                 )
@@ -201,6 +201,8 @@ def chat_with_hermes(user_id, user_prompt, project_name=None):
     memory_context = MEMORY_STORE.prompt_context(user_prompt, project_name=project_name)
     full_prompt = (
         f"你在飞书里是老板林家泽的贴身管家 Hermes。\n"
+        f"这是普通聊天通道：你没有操作电脑、文件、飞书或其他 Agent 的权限，不得声称已经执行、修改、配置或测试。\n"
+        f"如果老板要求实际操作，请明确说明需要发送“协作 <目标>”创建可审计任务；不要在聊天里模拟完成。\n"
         f"以下是最近的对话上下文（可能为空）：\n{history_text}\n"
         f"{memory_context}\n"
         f"请针对老板最新的消息给出亲切、干练、简洁的中文回复：\n"
@@ -233,36 +235,33 @@ def reply_feishu_msg(client, message_id, text_content):
         log_chat("out", "bot", text_content)  # 发消息持久化
 
 
+def _progress_card(title, body_text, details_text=None):
+    elements = [{"tag": "markdown", "content": body_text}]
+    if details_text is not None:
+        elements.append({
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "header": {
+                "title": {"tag": "plain_text", "content": "查看完整会议纪要"},
+                "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"},
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
+            "border": {"color": "grey", "corner_radius": "5px"},
+            "padding": "8px",
+            "elements": [{"tag": "markdown", "content": details_text[:18000]}],
+        })
+    return {
+        "schema": "2.0",
+        "header": {"title": {"tag": "plain_text", "content": title}},
+        "body": {"elements": elements},
+    }
+
+
 def send_progress_card(client, receive_id, title, body_text, details_text=None):
-    """发送一张 interactive 进度卡片，返回 msg_id（供后续 PATCH 更新）"""
+    """发送 JSON 2.0 interactive 进度卡片，返回可供 PATCH 更新的 msg_id。"""
     from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-    if details_text is None:
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": title}},
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": body_text}}],
-        }
-    else:
-        card = {
-            "schema": "2.0",
-            "header": {"title": {"tag": "plain_text", "content": title}},
-            "body": {"elements": [
-                {"tag": "markdown", "content": body_text},
-                {
-                    "tag": "collapsible_panel",
-                    "expanded": False,
-                    "header": {
-                        "title": {"tag": "plain_text", "content": "查看完整会议纪要"},
-                        "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"},
-                        "icon_position": "right",
-                        "icon_expanded_angle": -180,
-                    },
-                    "border": {"color": "grey", "corner_radius": "5px"},
-                    "padding": "8px",
-                    "elements": [{"tag": "markdown", "content": details_text[:18000]}],
-                },
-            ]},
-        }
+    card = _progress_card(title, body_text, details_text)
     req = (
         CreateMessageRequest.builder()
         .receive_id_type("chat_id")
@@ -285,15 +284,9 @@ def send_progress_card(client, receive_id, title, body_text, details_text=None):
 
 
 def update_progress_card(client, message_id, title, body_text):
-    """PATCH 更新已发送的进度卡片（同一 msg_id，不刷屏）"""
+    """PATCH 更新已发送的 JSON 2.0 进度卡片（同一 msg_id，不刷屏）。"""
     from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": title}},
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": body_text}}
-        ],
-    }
+    card = _progress_card(title, body_text)
     req = (
         PatchMessageRequest.builder()
         .message_id(message_id)
@@ -527,7 +520,7 @@ def handle_message(client, data: P2ImMessageReceiveV1):
         content_dict = json.loads(msg.content)
         raw_text = content_dict.get("text", "").strip()
         clean_text = re.sub(r"@_user_\d+\s*", "", raw_text).strip()
-        print(f"[消息内容]: {clean_text}")
+        print(f"[消息内容]: {redact(clean_text)}")
         chat_id_in = getattr(msg, "chat_id", None) or ""
         log_chat("in", user_id, clean_text, chat_id_in)  # 收消息持久化（带 chat_id）
 
