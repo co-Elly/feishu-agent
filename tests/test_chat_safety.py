@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import bot
 from agent_runtime import AgentResult
@@ -6,12 +7,20 @@ from settings import redact
 
 
 def test_redact_masks_common_inline_secrets():
-    text = "Bearer abc.def sk-example123456789 api_key=very-secret-value password:guessme"
+    text = "Bearer abc.def sk-example123456789 api_key=very-secret-value password:guessme access_key=temp-key&ticket=temp-ticket"
     safe = redact(text)
     assert "abc.def" not in safe
     assert "sk-example123456789" not in safe
     assert "very-secret-value" not in safe
     assert "guessme" not in safe
+    assert "temp-key" not in safe
+    assert "temp-ticket" not in safe
+
+
+def test_guardian_redacts_sdk_connection_credentials():
+    source = (Path(__file__).parents[1] / "_guardian.ps1").read_text(encoding="utf-8")
+    assert "Get-RedactedLogLine" in source
+    assert "access_key|ticket" in source
 
 
 def test_chat_log_redacts_before_persisting(tmp_path, monkeypatch):

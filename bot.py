@@ -772,7 +772,7 @@ def main():
         app_id=app_id,
         app_secret=app_secret,
         event_handler=event_handler,
-        log_level=lark.LogLevel.DEBUG,
+        log_level=lark.LogLevel.INFO,
     )
 
     print("✅ 飞书 WebSocket 长连接已建立！多智能体协作与 Obsidian 共用大脑已挂载！")

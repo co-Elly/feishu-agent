@@ -446,7 +446,7 @@ def validate_startup(config=None):
 
 def redact(value):
     """Return a log-safe copy without credentials or bearer tokens."""
-    secret_keys = {"app_secret", "api_key", "token", "authorization", "password"}
+    secret_keys = {"app_secret", "api_key", "access_key", "ticket", "token", "authorization", "password"}
     if isinstance(value, dict):
         return {key: ("***" if key.lower() in secret_keys else redact(item)) for key, item in value.items()}
     if isinstance(value, list):
@@ -455,7 +455,7 @@ def redact(value):
         text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer ***", value)
         text = re.sub(r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9._~+/=-]{12,}", "***", text)
         return re.sub(
-            r'''(?ix)(["']?(?:api[_-]?key|app[_-]?secret|access[_-]?token|authorization|password)["']?\s*[:=]\s*["']?)[^\s,"'}]+''',
+            r'''(?ix)(["']?(?:api[_-]?key|app[_-]?secret|access[_-]?key|access[_-]?token|ticket|authorization|password)["']?\s*[:=]\s*["']?)[^\s&,"'}]+''',
             r"\1***",
             text,
         )
