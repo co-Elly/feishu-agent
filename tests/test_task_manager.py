@@ -106,6 +106,18 @@ def test_retry_of_approved_swarm_reuses_plan_and_enters_execute(tmp_path, monkey
     assert retry["status"] == "queued"
 
 
+def test_approved_swarm_cannot_retry_without_new_user_message(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    task = store.create("swarm", "chat", "user", "old-msg", {"goal": "重试写入"})
+    assert store.claim(task["id"])
+    assert store.wait_for_approval(task["id"], {"project_name": "p"})
+    assert store.approve(task["id"]) == "approved"
+    assert store.claim(task["id"])
+    store.finish(task["id"], "failed", error="agent failed")
+
+    assert store.retry(task["id"], message_id=None) is None
+
+
 def test_default_list_hides_only_successful_chat_tasks(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     chat = store.create("chat", "chat", "user", "m1", {"prompt": "你好"})

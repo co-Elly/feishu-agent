@@ -21,6 +21,13 @@
 
 `runtime` 段统一配置 Obsidian 路径、反重力脚本、Codex/Hermes 命令、审批时限和任务并发数。若需临时覆盖 Codex 命令，可设置 `FEISHU_CODEX_COMMAND`。
 
+为保证反重力与 Codex 沙箱使用同一套测试依赖，初始化一次工作区内的测试环境：
+
+```powershell
+python -m venv .tools\test-venv
+.tools\test-venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
@@ -60,7 +67,7 @@ python bot.py
 ## 测试与安全边界
 
 ```powershell
-python -m pytest -q
+.tools\test-venv\Scripts\python.exe -m pytest -q
 ```
 
 三个本地 Agent 均使用参数数组启动，不使用 `shell=True`。网络故障最多重试一次，401 等认证错误不重试。圆桌只更新一张进度卡；单 Agent 故障会退出本场，其余成员满足法定人数时继续。

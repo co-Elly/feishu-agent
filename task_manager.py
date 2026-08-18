@@ -247,6 +247,8 @@ class TaskStore:
         if not old or old["status"] not in TERMINAL_STATES:
             return None
         reuse_approval = bool(old["task_type"] == "swarm" and old.get("approved_at") and old.get("plan"))
+        if reuse_approval and not message_id:
+            return None
         retry = self.create(
             old["task_type"], old["chat_id"], old["user_id"], message_id or old["message_id"],
             old["payload"], retry_of=old["id"], attempt=old["attempt"] + 1,
