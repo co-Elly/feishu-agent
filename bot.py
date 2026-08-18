@@ -28,7 +28,7 @@ from command_parser import extract_project_tag, parse_memory_command
 from control_store import engine_health, record_task_event
 from memory_store import MemoryStore
 from settings import load_config, redact, runtime_value, validate_startup
-from task_manager import TaskCancelled, TaskController
+from task_manager import TaskCancelled, TaskController, TaskParked
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -505,6 +505,8 @@ def execute_background_task(client, task, context):
         if task["task_type"] == "health_probe":
             return _run_health_task(client, task, context)
         raise ValueError(f"未知任务类型: {task['task_type']}")
+    except TaskParked:
+        raise
     except TaskCancelled:
         reply_feishu_msg(client, task["message_id"], f"🛑 任务 {task['id']} 已取消。")
         raise

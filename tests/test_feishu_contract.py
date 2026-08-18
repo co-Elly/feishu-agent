@@ -3,6 +3,8 @@ import io
 from types import SimpleNamespace
 
 import bot
+import pytest
+from task_manager import TaskParked
 
 
 def _event(text):
@@ -34,6 +36,21 @@ def test_normal_chat_is_acknowledged_without_running_agent_inline(monkeypatch):
     bot.handle_message(None, _event("你好"))
     assert submitted == [("chat", {"prompt": "你好", "project": None})]
     assert replies and "已收到" in replies[0]
+
+
+def test_waiting_approval_parks_without_failure_reply_or_evolution(monkeypatch):
+    replies, evolutions = [], []
+    monkeypatch.setattr(bot, "_run_swarm_task", lambda *args: (_ for _ in ()).throw(TaskParked()))
+    monkeypatch.setattr(bot, "reply_feishu_msg", lambda *args: replies.append(args))
+    monkeypatch.setattr(bot, "_evolve_after_task", lambda *args: evolutions.append(args))
+
+    with pytest.raises(TaskParked):
+        bot.execute_background_task(None, {
+            "id": "task-1", "task_type": "swarm", "message_id": "m1",
+        }, SimpleNamespace())
+
+    assert replies == []
+    assert evolutions == []
 
 
 def test_roundtable_speech_only_updates_one_card(monkeypatch):
