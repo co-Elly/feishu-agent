@@ -72,7 +72,7 @@ def test_failed_swarm_surfaces_final_validation_report(monkeypatch):
 
 
 def test_roundtable_speech_only_updates_one_card(monkeypatch):
-    replies, updates, cards = [], [], []
+    replies, updates, cards, memories = [], [], [], []
 
     class Context:
         def check_cancelled(self): pass
@@ -95,9 +95,13 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
     monkeypatch.setattr(bot, "_evolve_after_task", lambda *args: {
         "id": "evo12345", "content": "先验证现状再修改",
     })
+    monkeypatch.setattr(bot, "MEMORY_STORE", SimpleNamespace(
+        prompt_context=lambda *args, **kwargs: "",
+        add=lambda *args, **kwargs: memories.append((args, kwargs)),
+    ))
     monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO("# 会议纪要\n完整内容"))
     task = {"id": "t1", "task_type": "roundtable",
-            "payload": {"topic": "欢迎语", "project": None},
+            "payload": {"topic": "欢迎语", "project": "飞书机器人"},
             "message_id": "m1", "chat_id": "c1"}
     bot._run_roundtable_task(None, task, Context())
     assert all("不应单独发出的正文" not in reply for reply in replies)
@@ -106,6 +110,40 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
     assert cards[1][1]["details_text"].startswith("# 会议纪要")
     assert updates and any("最终总结" in str(args) for args in updates)
     assert any("本次进化" in str(args) for args in updates)
+    assert memories == [(('最终总结',), {
+        "project_name": "飞书机器人", "source_type": "roundtable",
+        "source_id": "t1", "source_path": "roundtable/s1/minutes.md",
+    })]
+
+
+def test_successful_project_swarm_saves_sourced_memory(monkeypatch):
+    memories, replies = [], []
+    monkeypatch.setattr(bot.swarm_orchestrator, "execute_collaborative_project",
+                        lambda *args, **kwargs: {
+                            "success": True, "project_name": "架构验收",
+                            "final_report": "验收：通过\n证据齐全",
+                        })
+    monkeypatch.setattr(bot, "MEMORY_STORE", SimpleNamespace(
+        add=lambda *args, **kwargs: memories.append((args, kwargs)),
+    ))
+    monkeypatch.setattr(bot, "_evolve_after_task", lambda *args: None)
+    monkeypatch.setattr(bot, "reply_feishu_msg", lambda *args: replies.append(args))
+    task = {
+        "id": "task-1", "task_type": "swarm", "message_id": "m1",
+        "phase": "execute", "approved_at": 1,
+        "plan": {"project_name": "架构验收"},
+        "payload": {"goal": "写文档", "project": "架构验收"},
+    }
+    context = SimpleNamespace(progress=lambda _text: None, check_cancelled=lambda: None)
+
+    result = bot._run_swarm_task(None, task, context)
+
+    assert result["success"] is True
+    assert memories == [(('验收：通过\n证据齐全',), {
+        "project_name": "架构验收", "source_type": "swarm",
+        "source_id": "task-1", "source_path": "Obsidian/架构验收",
+    })]
+    assert replies
 
 
 def test_minutes_card_uses_clickable_collapsible_panel(monkeypatch):
