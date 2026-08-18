@@ -57,8 +57,12 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
                         cards.append((args, kwargs)) or "card-1")
     monkeypatch.setattr(bot, "update_progress_card", lambda *args, **kwargs: updates.append(args) or True)
     monkeypatch.setattr(bot, "reply_feishu_msg", lambda client, message_id, text: replies.append(text))
+    monkeypatch.setattr(bot, "_evolve_after_task", lambda *args: {
+        "id": "evo12345", "content": "先验证现状再修改",
+    })
     monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO("# 会议纪要\n完整内容"))
-    task = {"id": "t1", "payload": {"topic": "欢迎语", "project": None},
+    task = {"id": "t1", "task_type": "roundtable",
+            "payload": {"topic": "欢迎语", "project": None},
             "message_id": "m1", "chat_id": "c1"}
     bot._run_roundtable_task(None, task, Context())
     assert all("不应单独发出的正文" not in reply for reply in replies)
@@ -66,6 +70,7 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
     assert len(cards) == 2
     assert cards[1][1]["details_text"].startswith("# 会议纪要")
     assert updates and any("最终总结" in str(args) for args in updates)
+    assert any("本次进化" in str(args) for args in updates)
 
 
 def test_minutes_card_uses_clickable_collapsible_panel(monkeypatch):
@@ -91,3 +96,25 @@ def test_minutes_card_uses_clickable_collapsible_panel(monkeypatch):
     panel = card["body"]["elements"][1]
     assert panel["tag"] == "collapsible_panel" and panel["expanded"] is False
     assert panel["elements"][0]["content"] == "# 完整内容"
+
+
+def test_meaningful_task_learns_one_auditable_evolution_rule(monkeypatch):
+    added, events = [], []
+
+    class Store:
+        def add_evolution(self, content, task_id, project_name=None):
+            added.append((content, task_id, project_name))
+            return {"id": "evo12345", "content": content, "scope": "project"}
+
+    monkeypatch.setattr(bot, "MEMORY_STORE", Store())
+    monkeypatch.setattr(bot, "call_hermes", lambda *args, **kwargs: SimpleNamespace(
+        ok=True, text="先验证现状再修改", error_code=None, duration_ms=12,
+    ))
+    monkeypatch.setattr(bot, "record_task_event", lambda *args, **kwargs: events.append((args, kwargs)))
+    task = {"id": "task-1", "task_type": "swarm", "payload": {"project": "A"}}
+
+    memory = bot._evolve_after_task(task, "任务成功")
+
+    assert memory["id"] == "evo12345"
+    assert added == [("先验证现状再修改", "task-1", "A")]
+    assert any(args[1] == "evolution_learned" for args, _ in events)

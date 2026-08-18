@@ -325,6 +325,34 @@ def _task_line(task):
     return f"{task['id']} · {TASK_STATUS_TEXT.get(task['status'], task['status'])} · {task['task_type']} · {title[:35]}"
 
 
+def _evolve_after_task(task, outcome_text):
+    """Best-effort, one-rule postmortem for meaningful work tasks."""
+    if task["task_type"] not in {"roundtable", "swarm"}:
+        return None
+    try:
+        result = call_hermes(
+            "你是受控进化复盘员，只做文本复盘，不操作电脑。根据下面任务结果，提炼一条以后可复用的工作规则。"
+            "规则必须是流程或验证方法，不得写任务专属事实，不得改变系统约束、权限或人工审批。"
+            "只输出一条中文规则，最多120字。\n\n"
+            f"任务类型：{task['task_type']}\n任务结果：{str(outcome_text)[:4000]}",
+            timeout=120,
+        )
+        record_task_event(task["id"], "evolution_agent_result", engine="hermes", ok=result.ok,
+                          error_code=result.error_code, duration_ms=result.duration_ms)
+        if not result.ok or not result.text.strip():
+            return None
+        memory = MEMORY_STORE.add_evolution(
+            result.text.strip()[:500], task["id"], project_name=task["payload"].get("project"),
+        )
+        record_task_event(task["id"], "evolution_learned",
+                          details={"memory_id": memory["id"], "scope": memory["scope"]})
+        return memory
+    except Exception as exc:
+        record_task_event(task["id"], "evolution_failed",
+                          details={"error": f"{type(exc).__name__}: {exc}"[:300]})
+        return None
+
+
 def _run_roundtable_task(client, task, context):
     topic = task["payload"]["topic"]
     msg_id = task["message_id"]
@@ -387,7 +415,14 @@ def _run_roundtable_task(client, task, context):
     if project:
         MEMORY_STORE.add(result["final_summary"], project_name=project, source_type="roundtable",
                          source_id=task["id"], source_path=minutes_rel)
-    return {"session_id": result["session_id"], "rounds": result["rounds_used"], "summary": result["final_summary"], "unavailable_agents": result.get("unavailable_agents", {})}
+    context.progress("会议完成，正在执行一次任务后进化复盘")
+    evolution = _evolve_after_task(task, result["final_summary"])
+    if evolution and card_msg_id:
+        update_progress_card(client, card_msg_id, "✅ 圆桌会议完成",
+                             final_body + f"\n\n🧬 **本次进化**：{evolution['content']}（ID {evolution['id']}）")
+    return {"session_id": result["session_id"], "rounds": result["rounds_used"],
+            "summary": result["final_summary"], "unavailable_agents": result.get("unavailable_agents", {}),
+            "evolution_memory_id": evolution["id"] if evolution else None}
 
 
 def _run_swarm_task(client, task, context):
@@ -422,11 +457,16 @@ def _run_swarm_task(client, task, context):
     )
     if not result["success"]:
         raise RuntimeError("Codex 实现或验证失败，请查看阶段输出后重试")
-    reply_feishu_msg(client, msg_id, f"✅ 协作任务 {task['id']} 已完成，项目：{result['project_name']}\n\n{result['final_report'][:1000]}")
     if project:
         MEMORY_STORE.add(result["final_report"], project_name=project, source_type="swarm",
                          source_id=task["id"], source_path=f"Obsidian/{result['project_name']}")
-    return {"project_name": result["project_name"], "success": result["success"], "final_report": result["final_report"]}
+    context.progress("协作完成，正在执行一次任务后进化复盘")
+    evolution = _evolve_after_task(task, result["final_report"])
+    evolution_text = f"\n\n🧬 本次进化：{evolution['content']}（ID {evolution['id']}）" if evolution else ""
+    reply_feishu_msg(client, msg_id, f"✅ 协作任务 {task['id']} 已完成，项目：{result['project_name']}\n\n{result['final_report'][:1000]}{evolution_text}")
+    return {"project_name": result["project_name"], "success": result["success"],
+            "final_report": result["final_report"],
+            "evolution_memory_id": evolution["id"] if evolution else None}
 
 
 def _run_chat_task(client, task, context):
@@ -466,6 +506,7 @@ def execute_background_task(client, task, context):
         reply_feishu_msg(client, task["message_id"], f"🛑 任务 {task['id']} 已取消。")
         raise
     except Exception as exc:
+        _evolve_after_task(task, f"任务失败：{type(exc).__name__}: {exc}")
         reply_feishu_msg(client, task["message_id"], f"❌ 任务 {task['id']} 执行失败：{type(exc).__name__}: {exc}")
         raise
 

@@ -26,3 +26,14 @@ def test_prompt_limits_and_no_implicit_project_scope(tmp_path):
     assert store.prompt_context("").count("|全局|") == 3
     assert "|项目:A|" not in store.prompt_context("")
     assert store.prompt_context("", project_name="A").count("|项目:A|") == 5
+
+
+def test_one_evolution_per_task_is_always_injected_and_deletable(tmp_path):
+    store = MemoryStore(str(tmp_path / "evolution.db"))
+    first = store.add_evolution("先验证现状再修改", "task-1")
+    duplicate = store.add_evolution("不应重复写入", "task-1")
+
+    assert duplicate["id"] == first["id"]
+    assert "先验证现状再修改" in store.prompt_context("完全无关的查询")
+    assert store.delete(first["id"])
+    assert "先验证现状再修改" not in store.prompt_context("完全无关的查询")
