@@ -53,6 +53,24 @@ def test_waiting_approval_parks_without_failure_reply_or_evolution(monkeypatch):
     assert evolutions == []
 
 
+def test_failed_swarm_surfaces_final_validation_report(monkeypatch):
+    monkeypatch.setattr(bot.swarm_orchestrator, "execute_collaborative_project",
+                        lambda *args, **kwargs: {
+                            "success": False,
+                            "final_report": "验收：不通过\n全量测试缺少 lark_oapi",
+                        })
+    task = {
+        "id": "task-1", "task_type": "swarm", "message_id": "m1",
+        "phase": "execute", "approved_at": 1,
+        "plan": {"project_name": "验收"},
+        "payload": {"goal": "写文档", "project": "验收"},
+    }
+    context = SimpleNamespace(progress=lambda _text: None, check_cancelled=lambda: None)
+
+    with pytest.raises(RuntimeError, match="全量测试缺少 lark_oapi"):
+        bot._run_swarm_task(None, task, context)
+
+
 def test_roundtable_speech_only_updates_one_card(monkeypatch):
     replies, updates, cards = [], [], []
 
