@@ -426,17 +426,26 @@ def _run_swarm_task(client, task, context):
     def on_agent_speak(role_tag, message_text):
         context.progress(f"{role_tag} 已完成当前阶段")
         record_task_event(task["id"], "agent_stage_completed", details={"role": role_tag})
+
+    def on_agent_result(role_tag, engine, result):
+        record_task_event(
+            task["id"], "agent_result", engine=engine, ok=result.ok,
+            error_code=result.error_code, duration_ms=result.duration_ms,
+            details={"role": role_tag},
+        )
     if task["phase"] == "planning":
         context.progress("Hermes PM → 反重力架构师 → Codex 只读探索，正在生成方案")
         plan = swarm_orchestrator.plan_collaborative_project(
             goal, project_name=project,
             memory_context=MEMORY_STORE.prompt_context(goal, project_name=project),
-            on_agent_message=on_agent_speak, cancel_check=context.check_cancelled,
+            on_agent_message=on_agent_speak, on_agent_result=on_agent_result,
+            cancel_check=context.check_cancelled,
         )
         preview = (
             f"**任务**：{task['id']}\n**项目**：{plan['project_name']}\n"
             f"**目标**：{goal}\n\n**方案摘要**：\n{plan['requirements'][:500]}\n\n"
             f"**影响与风险**：\n{plan['impact_and_risks'][:500]}\n\n"
+            "**系统产物**：任务快照、SQLite 审计、项目记忆与 Obsidian 纪要；不计入业务文件变更。\n\n"
             f"⏳ 30 分钟内发送 `批准任务 {task['id']}`，或 `拒绝任务 {task['id']}`。"
         )
         send_progress_card(client, task["chat_id"], "🛂 写入预审", preview)
@@ -446,7 +455,8 @@ def _run_swarm_task(client, task, context):
         raise RuntimeError("缺少有效写入批准")
     context.progress("已批准，反重力第一棒即将独占写入工作区")
     result = swarm_orchestrator.execute_collaborative_project(
-        plan, on_agent_message=on_agent_speak, cancel_check=context.check_cancelled,
+        plan, on_agent_message=on_agent_speak, on_agent_result=on_agent_result,
+        cancel_check=context.check_cancelled,
     )
     if not result["success"]:
         raise RuntimeError("Codex 实现或验证失败，请查看阶段输出后重试")
