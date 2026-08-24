@@ -8,6 +8,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import roundtable_engine as re_
 
 
+def test_meeting_budget_scales_team_and_rounds_by_task_load():
+    assert re_.meeting_budget("讨论欢迎语文案")["agents"] == ["pm", "dev"]
+    assert re_.meeting_budget("讨论欢迎语文案")["max_rounds"] == 2
+    high = re_.meeting_budget("设计数据库迁移、接口兼容和全量测试架构")
+    assert high["agents"] == ["pm", "arch", "dev"]
+    assert high["max_rounds"] == 4
+
+
 # ---------------------------------------------------------------- extract_stance
 def test_stance_format_agree():
     assert re_.extract_stance("立场：同意\n方案可行") == "同意"

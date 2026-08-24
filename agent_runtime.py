@@ -14,6 +14,73 @@ from control_store import record_engine_health
 from settings import BASE_DIR, runtime_value
 
 
+class _WindowsKillJob:
+    """Own a Windows Job Object that kills an invocation's full child tree on close."""
+    KILL_ON_JOB_CLOSE = 0x00002000
+
+    def __init__(self):
+        self.handle = None
+
+    def assign(self, proc):
+        if os.name != "nt":
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                      wintypes.LPVOID, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return False
+        info = EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = self.KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(handle)
+            return False
+        if not kernel32.AssignProcessToJobObject(handle, wintypes.HANDLE(proc._handle)):
+            kernel32.CloseHandle(handle)
+            return False
+        self.handle = handle
+        return True
+
+    def close(self):
+        if self.handle and os.name == "nt":
+            import ctypes
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(self.handle)
+            self.handle = None
+
+
 @dataclass(frozen=True)
 class AgentResult:
     ok: bool
@@ -28,7 +95,31 @@ ERROR_LABELS = {
     "missing_command": "缺少命令", "authentication": "认证失败",
     "quota_exhausted": "额度耗尽", "timeout": "调用超时",
     "network": "网络故障", "process_error": "进程异常",
+    "unsafe_configuration": "不安全配置",
+    "sandbox_error": "沙箱执行失败",
 }
+
+
+ZERO_EXIT_ERROR_MARKERS = (
+    "encountered error in step execution",
+    "sandbox configuration error",
+    "error executing cascade step",
+    "cortex_step_type_run_command",
+)
+
+
+def antigravity_script_safety(script, expected_mode):
+    try:
+        text = open(script, encoding="utf-8").read().lower()
+    except OSError as exc:
+        return False, f"无法读取反重力启动脚本: {exc}"
+    if "--dangerously-skip-permissions" in text:
+        return False, "启动脚本启用了 --dangerously-skip-permissions"
+    if "--sandbox" not in text:
+        return False, "启动脚本未启用 --sandbox"
+    if not re.search(rf"--mode\s+{re.escape(expected_mode)}(?:\s|$)", text):
+        return False, f"启动脚本未使用 --mode {expected_mode}"
+    return True, ""
 
 
 def cooldown_seconds(text, code):
@@ -67,33 +158,59 @@ def _result(engine, started, ok, text, error_code=None, retryable=False):
     return result
 
 
-def _run(engine, command, timeout, cwd, input_text=None):
+def _run(engine, command, timeout, cwd, input_text=None, extra_env=None):
     """Run once; only network-class failures receive one retry."""
     started = time.monotonic()
     for attempt in range(2):
+        proc, kill_job = None, _WindowsKillJob()
         try:
-            proc = subprocess.run(
-                command, input=input_text, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout, cwd=cwd,
-                env={**os.environ, "PYTHONUTF8": "1"}, shell=False,
+            proc = subprocess.Popen(
+                command, stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace", cwd=cwd,
+                env={**os.environ, **(extra_env or {}), "PYTHONUTF8": "1"}, shell=False,
             )
+            kill_job.assign(proc)
+            stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
         except Exception as exc:
+            kill_job.close()
+            if proc and proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
             code, retryable = classify_error(str(exc), exc)
             if code == "network" and attempt == 0:
                 continue
             return _result(engine, started, False, f"{ERROR_LABELS[code]}: {exc}", code, retryable)
-        stdout, stderr = (proc.stdout or "").strip(), (proc.stderr or "").strip()
-        if proc.returncode == 0 and stdout:
-            lower_stdout = stdout.lower()
-            if any(token in lower_stdout for token in (
+        finally:
+            kill_job.close()
+        stdout, stderr = (stdout or "").strip(), (stderr or "").strip()
+        if proc.returncode == 0:
+            combined = "\n".join(part for part in (stdout, stderr) if part)
+            lower_combined = combined.lower()
+            if any(token in lower_combined for token in ZERO_EXIT_ERROR_MARKERS):
+                return _result(
+                    engine, started, False,
+                    f"{ERROR_LABELS['sandbox_error']}: {combined[-600:]}",
+                    "sandbox_error", False,
+                )
+            if any(token in lower_combined for token in (
                 "401 unauthorized", "resource_exhausted", "individual quota reached",
                 "authentication failed", "eligibility error",
             )):
-                code, retryable = classify_error(stdout)
-                return _result(engine, started, False, f"{ERROR_LABELS[code]}: {stdout[-600:]}", code, retryable)
-            return _result(engine, started, True, stdout)
-        detail = stderr or stdout or f"进程退出码 {proc.returncode}"
-        code, retryable = classify_error(detail)
+                code, retryable = classify_error(combined)
+                return _result(engine, started, False, f"{ERROR_LABELS[code]}: {combined[-600:]}", code, retryable)
+            if stdout:
+                return _result(engine, started, True, stdout)
+        diagnostic = stderr or (
+            stdout if len(stdout) < 2000 else f"进程退出码 {proc.returncode}；模型已产生长输出但执行器未成功退出"
+        )
+        detail = diagnostic
+        if stdout and stdout != diagnostic:
+            detail += f"\n模型输出尾部：{stdout[-400:]}"
+        code, retryable = classify_error(diagnostic)
         if code == "network" and attempt == 0:
             continue
         return _result(engine, started, False, f"{ERROR_LABELS[code]}: {detail[-600:]}", code, retryable)
@@ -110,14 +227,15 @@ def isolated_prompt_file(prefix, content):
     return handle.name
 
 
-def call_codex(task_text, timeout=300, writable=False):
+def call_codex(task_text, timeout=300, writable=False, workspace_dir=None):
     configured = os.environ.get("FEISHU_CODEX_COMMAND") or runtime_value("codex_command")
     sandbox = "workspace-write" if writable else "read-only"
+    target_dir = os.path.abspath(workspace_dir or BASE_DIR)
     command = shlex.split(configured, posix=False) + [
         "exec", "--skip-git-repo-check", "--color", "never", "--sandbox", sandbox,
-        "-C", BASE_DIR, "-",
+        "--ephemeral", "-C", target_dir, "-",
     ]
-    return _run("codex", command, timeout, BASE_DIR, input_text=task_text)
+    return _run("codex", command, timeout, target_dir, input_text=task_text)
 
 
 def call_hermes(task_text, timeout=300):
@@ -131,14 +249,23 @@ def call_hermes(task_text, timeout=300):
     return _run("hermes", command, timeout, BASE_DIR)
 
 
-def call_antigravity(task_text, timeout=200, model="low"):
+def call_antigravity(task_text, timeout=200, model="low", workspace_dir=None):
     task_file = isolated_prompt_file("agy_", task_text)
     if task_file.startswith("/mnt/"):
         drive = task_file[5].upper()
         task_file = f"{drive}:{task_file[6:].replace('/', chr(92))}"
     script = runtime_value("antigravity_script_high" if model == "high" else "antigravity_script_low")
+    expected_mode = "plan"
+    safe, reason = antigravity_script_safety(script, expected_mode)
+    if not safe:
+        return _result("antigravity", time.monotonic(), False, reason,
+                       "unsafe_configuration", False)
     command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, task_file]
-    return _run("antigravity", command, timeout, "C:\\")
+    service_profile = os.path.abspath(runtime_value("antigravity_service_profile"))
+    return _run(
+        "antigravity", command, timeout, os.path.abspath(workspace_dir or "C:\\"),
+        extra_env={"USERPROFILE": service_profile},
+    )
 
 
 AGENT_CALLS = {"hermes": call_hermes, "antigravity": call_antigravity, "codex": call_codex}
@@ -146,11 +273,14 @@ AGENT_CALLS = {"hermes": call_hermes, "antigravity": call_antigravity, "codex": 
 
 def lightweight_health():
     codex_parts = shlex.split(str(runtime_value("codex_command")), posix=False)
+    antigravity_safe = all(
+        antigravity_script_safety(runtime_value(key), mode)[0]
+        for key, mode in (("antigravity_script_low", "plan"),
+                          ("antigravity_script_high", "plan"))
+    )
     return {
         "hermes": bool(runtime_value("hermes_command")) and shutil.which("wsl.exe") is not None,
-        "antigravity": shutil.which("powershell.exe") is not None and any(
-            os.path.isfile(runtime_value(key)) for key in ("antigravity_script_low", "antigravity_script_high")
-        ),
+        "antigravity": shutil.which("powershell.exe") is not None and antigravity_safe,
         "codex": bool(codex_parts) and shutil.which(codex_parts[0]) is not None,
     }
 

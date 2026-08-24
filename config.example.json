@@ -13,12 +13,14 @@
   },
   "runtime": {
     "workspace_dir": "E:\\feishu-agent\\workspace",
+    "execution_dir": "C:\\Users\\YOUR_NAME\\AppData\\Local\\feishu-agent\\executions",
     "obsidian_vault": "E:\\Obsidian_Vault\\多agent",
     "antigravity_script_high": "C:\\Users\\YOUR_NAME\\AppData\\Local\\agy\\run_task_pro.ps1",
     "antigravity_script_low": "C:\\Users\\YOUR_NAME\\AppData\\Local\\agy\\run_task_pro_low.ps1",
+    "antigravity_service_profile": "E:\\CodexHome\\feishu-agent-antigravity",
     "codex_command": "codex",
     "hermes_command": "hermes",
-    "test_command": "E:\\feishu-agent\\.tools\\test-venv\\Scripts\\python.exe -m pytest",
+    "test_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\\feishu-agent\\scripts\\verify.ps1",
     "approval_ttl_seconds": 1800,
     "task_workers": 4
   },

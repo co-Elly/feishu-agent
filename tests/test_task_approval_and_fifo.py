@@ -10,6 +10,19 @@ def _store(tmp_path, monkeypatch):
     return task_manager.TaskStore()
 
 
+def _swarm_payload(goal="g", **extra):
+    payload = {
+        "goal": goal, "workflow_id": "workflow-1", "meeting_task_id": "meeting-1",
+        "collaboration_confirmation": {
+            "workflow_id": "workflow-1", "meeting_task_id": "meeting-1",
+            "confirmed_by": "u", "confirmation_message_id": "confirm-1",
+            "confirmed_at": 1,
+        },
+    }
+    payload.update(extra)
+    return payload
+
+
 def _wait(store, task_ids, timeout=3):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -22,7 +35,7 @@ def _wait(store, task_ids, timeout=3):
 
 def test_approval_is_atomic_idempotent_and_requeues_at_tail(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
-    first = store.create("swarm", "chat", "u", "m", {"goal": "g"})
+    first = store.create("swarm", "chat", "u", "m", _swarm_payload())
     assert store.claim(first["id"])
     assert store.wait_for_approval(first["id"], {"project_name": "P"}, ttl_seconds=60)
     second = store.create("chat", "chat", "u", "m2", {"prompt": "next"})
@@ -31,9 +44,28 @@ def test_approval_is_atomic_idempotent_and_requeues_at_tail(tmp_path, monkeypatc
     assert store.next_queued("chat")["id"] == second["id"]
 
 
+def test_approval_records_immutable_receipt(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    task = store.create("swarm", "chat", "owner", "m", _swarm_payload(
+        constraint_envelope={"version": 1, "root_request": "g"},
+    ))
+    assert store.claim(task["id"])
+    assert store.wait_for_approval(task["id"], {"project_name": "P"}, ttl_seconds=60)
+    assert store.approve(task["id"], approved_by="owner", approval_message_id="approval-msg") == "approved"
+    approved = store.get(task["id"])
+    assert approved["approved_by"] == "owner"
+    assert approved["approval_message_id"] == "approval-msg"
+    assert len(approved["plan_hash"]) == 64
+    assert len(approved["constraint_hash"]) == 64
+    assert len(approved["workspace_baseline_hash"]) == 64
+    assert task_manager.approval_receipt_valid(approved)
+    approved["plan"]["project_name"] = "tampered"
+    assert not task_manager.approval_receipt_valid(approved)
+
+
 def test_approval_expiry_cancels_task(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
-    task = store.create("swarm", "chat", "u", "m", {"goal": "g"})
+    task = store.create("swarm", "chat", "u", "m", _swarm_payload())
     assert store.claim(task["id"])
     assert store.wait_for_approval(task["id"], {}, ttl_seconds=-1)
     assert store.approve(task["id"]) == "not_waiting"
@@ -42,10 +74,19 @@ def test_approval_expiry_cancels_task(tmp_path, monkeypatch):
 
 def test_waiting_approval_survives_restart(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
-    task = store.create("swarm", "chat", "u", "m", {"goal": "g"})
+    task = store.create("swarm", "chat", "u", "m", _swarm_payload())
     assert store.claim(task["id"])
     assert store.wait_for_approval(task["id"], {}, ttl_seconds=60)
     store.recover()
+    assert store.get(task["id"])["status"] == "waiting_approval"
+
+
+def test_approval_rejects_legacy_swarm_without_collaboration_confirmation(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    task = store.create("swarm", "chat", "u", "m", {"goal": "legacy"})
+    assert store.claim(task["id"])
+    assert store.wait_for_approval(task["id"], {"project_name": "P"}, ttl_seconds=60)
+    assert store.approve(task["id"]) == "missing_collaboration_confirmation"
     assert store.get(task["id"])["status"] == "waiting_approval"
 
 

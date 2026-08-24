@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 from functools import lru_cache
 import yaml
@@ -22,12 +23,26 @@ ALLOWED_SUMMARY_VARIABLES = {"topic", "agent_count", "members", "all_views"}
 
 RUNTIME_DEFAULTS = {
     "workspace_dir": os.path.join(BASE_DIR, "workspace"),
+    "execution_dir": os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+        "feishu-agent", "executions",
+    ),
     "obsidian_vault": os.environ.get("FEISHU_OBSIDIAN_VAULT", os.path.join(BASE_DIR, "workspace", "obsidian")),
     "antigravity_script_high": os.environ.get("FEISHU_ANTIGRAVITY_HIGH", ""),
     "antigravity_script_low": os.environ.get("FEISHU_ANTIGRAVITY_LOW", ""),
+    "antigravity_service_profile": os.environ.get(
+        "FEISHU_ANTIGRAVITY_PROFILE",
+        os.path.join(
+            os.environ.get("CODEX_HOME") or os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+            "feishu-agent-antigravity",
+        ),
+    ),
     "codex_command": "codex",
     "hermes_command": "hermes",
-    "test_command": f'"{sys.executable}" -m pytest',
+    "test_command": (
+        f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File '
+        f'"{os.path.join(BASE_DIR, "scripts", "verify.ps1")}"'
+    ),
     "approval_ttl_seconds": 1800,
     "task_workers": 4,
 }
@@ -419,6 +434,24 @@ def load_config():
     runtime = dict(RUNTIME_DEFAULTS)
     runtime.update(config.get("runtime") or {})
     runtime["workspace_dir"] = os.path.abspath(runtime["workspace_dir"])
+    runtime["execution_dir"] = os.path.abspath(runtime["execution_dir"])
+    runtime["antigravity_service_profile"] = os.path.abspath(
+        runtime["antigravity_service_profile"]
+    )
+    try:
+        nested_execution = os.path.commonpath([BASE_DIR, runtime["execution_dir"]]) == BASE_DIR
+    except ValueError:
+        nested_execution = False
+    if nested_execution:
+        raise ConfigError("execution_dir 必须位于主项目目录之外，避免沙箱识别到真实仓库")
+    try:
+        nested_profile = os.path.commonpath(
+            [BASE_DIR, runtime["antigravity_service_profile"]]
+        ) == BASE_DIR
+    except ValueError:
+        nested_profile = False
+    if nested_profile:
+        raise ConfigError("antigravity_service_profile 必须位于主项目目录之外")
     config["runtime"] = runtime
     return config
 
@@ -436,9 +469,25 @@ def validate_startup(config=None):
         raise ConfigError("飞书凭据缺失: " + ", ".join(missing))
     warnings = []
     runtime = config["runtime"]
-    for label, key in (("反重力高质量脚本", "antigravity_script_high"), ("反重力快速脚本", "antigravity_script_low")):
+    for label, key, mode in (("反重力高质量脚本", "antigravity_script_high", "plan"),
+                             ("反重力快速脚本", "antigravity_script_low", "plan")):
         if not os.path.isfile(runtime[key]):
             warnings.append(f"{label}不存在，相关 Agent 将降级: {runtime[key]}")
+            continue
+        try:
+            script_text = open(runtime[key], encoding="utf-8").read().lower()
+        except OSError as exc:
+            warnings.append(f"{label}无法读取，相关 Agent 将降级: {exc}")
+            continue
+        if ("--dangerously-skip-permissions" in script_text or "--sandbox" not in script_text
+                or not re.search(rf"--mode\s+{re.escape(mode)}(?:\s|$)", script_text)):
+            warnings.append(f"{label}未启用受控沙箱模式，运行时将拒绝调用")
+    service_profile = runtime["antigravity_service_profile"]
+    oauth_token = os.path.join(
+        service_profile, ".gemini", "antigravity-cli", "antigravity-oauth-token"
+    )
+    if not os.path.isfile(oauth_token):
+        warnings.append("反重力服务隔离配置缺少认证令牌，相关 Agent 将降级")
     if not str(runtime.get("codex_command", "")).strip():
         warnings.append("未配置 Codex 命令，Codex Agent 将降级")
     if not str(runtime.get("hermes_command", "")).strip():

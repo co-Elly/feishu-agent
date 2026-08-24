@@ -2,6 +2,7 @@ import os
 import json
 import time
 from settings import runtime_value
+from command_parser import validate_project_name
 
 VAULT_BASE = runtime_value("obsidian_vault")
 
@@ -13,7 +14,11 @@ class ObsidianBridge:
 
     def get_project_dir(self, project_name):
         """获取二级项目目录路径"""
-        proj_dir = os.path.join(self.base_dir, project_name)
+        project_name = validate_project_name(project_name)
+        base = os.path.realpath(self.base_dir)
+        proj_dir = os.path.realpath(os.path.join(base, project_name))
+        if os.path.commonpath([base, proj_dir]) != base:
+            raise ValueError("项目目录越出 Obsidian 根目录")
         os.makedirs(proj_dir, exist_ok=True)
         return proj_dir
 

@@ -1,8 +1,10 @@
 """Persistent per-chat FIFO task state machine with approval parking."""
 
 import json
+import hashlib
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -11,12 +13,69 @@ from concurrent.futures import ThreadPoolExecutor
 from control_store import record_task_event as _record_task_event
 from conversation_store import DB_PATH
 from settings import runtime_value
+from workspace_lease import release_workspace_leases
 
 
 WORK_ROOT = os.path.join(runtime_value("workspace_dir"), "tasks")
-TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+TERMINAL_STATES = {"succeeded", "failed", "cancelled", "needs_review", "blocked"}
 ACTIVE_STATES = {"queued", "running", "waiting_approval"}
 WORKSPACE_WRITE_LOCK = threading.Lock()
+
+
+def collaboration_handoff_valid(payload):
+    """A swarm task exists only after an owner explicitly confirms a meeting handoff."""
+    payload = payload or {}
+    receipt = payload.get("collaboration_confirmation") or {}
+    required = (
+        payload.get("workflow_id"), payload.get("meeting_task_id"),
+        receipt.get("workflow_id"), receipt.get("meeting_task_id"),
+        receipt.get("confirmed_by"), receipt.get("confirmation_message_id"),
+        receipt.get("confirmed_at"),
+    )
+    return bool(
+        all(required)
+        and receipt.get("workflow_id") == payload.get("workflow_id")
+        and receipt.get("meeting_task_id") == payload.get("meeting_task_id")
+    )
+
+
+def _stable_hash(value):
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def workspace_fingerprint(root=None):
+    """Hash all Git-visible content, including pre-existing dirty and untracked files."""
+    root = os.path.abspath(root or os.path.dirname(__file__))
+    proc = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"],
+                          cwd=root, capture_output=True, check=False)
+    if proc.returncode != 0:
+        return None
+    digest = hashlib.sha256()
+    for raw in sorted(item for item in proc.stdout.split(b"\0") if item):
+        relative = raw.decode("utf-8", "surrogateescape").replace("/", os.sep)
+        path = os.path.join(root, relative)
+        digest.update(raw + b"\0")
+        if os.path.isfile(path):
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def approval_receipt_valid(task):
+    """Verify that the approved plan and constraint envelope were not replaced later."""
+    if not task or not task.get("approved_at"):
+        return False
+    if not task.get("plan_hash") and not task.get("constraint_hash"):
+        return True  # compatibility for tasks approved before receipt migration
+    plan = task.get("plan") or {}
+    payload = task.get("payload") or {}
+    constraint = plan.get("constraint_envelope") or payload.get("constraint_envelope") or {}
+    hashes_valid = (task.get("plan_hash") == _stable_hash(plan)
+                    and task.get("constraint_hash") == _stable_hash(constraint))
+    baseline = task.get("workspace_baseline_hash")
+    return hashes_valid and (not baseline or baseline == workspace_fingerprint())
 
 
 def record_task_event(*args, **kwargs):
@@ -30,6 +89,18 @@ class TaskCancelled(Exception):
 
 class TaskParked(Exception):
     pass
+
+
+class TaskNeedsReview(Exception):
+    def __init__(self, message, result=None):
+        super().__init__(message)
+        self.result = result
+
+
+class TaskBlocked(Exception):
+    def __init__(self, message, result=None):
+        super().__init__(message)
+        self.result = result
 
 
 def _connect():
@@ -56,12 +127,19 @@ def _connect():
     migrations = {
         "phase": "TEXT NOT NULL DEFAULT 'execute'", "plan_json": "TEXT",
         "approval_expires_at": "REAL", "approved_at": "REAL",
+        "approved_by": "TEXT", "approval_message_id": "TEXT",
+        "plan_hash": "TEXT", "constraint_hash": "TEXT",
+        "workspace_baseline_hash": "TEXT",
     }
     for name, ddl in migrations.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_chat_created ON tasks(chat_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS task_checkpoints (
+        task_id TEXT NOT NULL, checkpoint TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}',
+        created_at REAL NOT NULL, PRIMARY KEY(task_id, checkpoint)
+    )""")
     return conn
 
 
@@ -88,6 +166,22 @@ def _write_snapshot(task):
 
 
 class TaskStore:
+    def checkpoint(self, task_id, checkpoint, details=None):
+        now = time.time()
+        with _connect() as conn:
+            conn.execute("""INSERT INTO task_checkpoints(task_id, checkpoint, details_json, created_at)
+                VALUES(?,?,?,?) ON CONFLICT(task_id, checkpoint) DO UPDATE SET
+                details_json=excluded.details_json, created_at=excluded.created_at""",
+                (task_id, checkpoint, json.dumps(details or {}, ensure_ascii=False), now))
+        record_task_event(task_id, "checkpoint", details={"checkpoint": checkpoint, **(details or {})})
+
+    def checkpoints(self, task_id):
+        with _connect() as conn:
+            rows = conn.execute("""SELECT checkpoint, details_json, created_at FROM task_checkpoints
+                WHERE task_id=? ORDER BY created_at""", (task_id,)).fetchall()
+        return [{"checkpoint": row["checkpoint"], "details": json.loads(row["details_json"] or "{}"),
+                 "created_at": row["created_at"]} for row in rows]
+
     def create(self, task_type, chat_id, user_id, message_id, payload, retry_of=None, attempt=1,
                phase=None, plan=None, approved_at=None):
         task_id, now = uuid.uuid4().hex[:10], time.time()
@@ -188,23 +282,41 @@ class TaskStore:
             _write_snapshot(self.get(row["id"]))
         return [row["id"] for row in rows]
 
-    def approve(self, task_id):
+    def approve(self, task_id, approved_by=None, approval_message_id=None):
         self.expire_approvals()
         now = time.time()
         with _connect() as conn:
-            row = conn.execute("SELECT status, approved_at FROM tasks WHERE id=?", (task_id,)).fetchone()
+            row = conn.execute(
+                "SELECT status, approved_at, plan_json, payload_json FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
             if not row:
                 return "not_found"
             if row["approved_at"] is not None:
                 return "already_approved"
             if row["status"] != "waiting_approval":
                 return "not_waiting"
+            plan = json.loads(row["plan_json"] or "{}")
+            payload = json.loads(row["payload_json"] or "{}")
+            if not collaboration_handoff_valid(payload):
+                return "missing_collaboration_confirmation"
+            constraint = plan.get("constraint_envelope") or payload.get("constraint_envelope") or {}
+            plan_hash, constraint_hash = _stable_hash(plan), _stable_hash(constraint)
+            baseline_hash = workspace_fingerprint()
             cursor = conn.execute("""UPDATE tasks SET status='queued', phase='execute', approved_at=?,
+                approved_by=?, approval_message_id=?, plan_hash=?, constraint_hash=?,
+                workspace_baseline_hash=?,
                 started_at=NULL, progress='已批准，重新排队', updated_at=?
-                WHERE id=? AND status='waiting_approval' AND approved_at IS NULL""", (now, now, task_id))
+                WHERE id=? AND status='waiting_approval' AND approved_at IS NULL""",
+                (now, approved_by, approval_message_id, plan_hash, constraint_hash,
+                 baseline_hash, now, task_id))
         if not cursor.rowcount:
             return "already_approved"
-        record_task_event(task_id, "approved", "waiting_approval", "queued")
+        record_task_event(task_id, "approved", "waiting_approval", "queued", details={
+            "approved_by": approved_by, "approval_message_id": approval_message_id,
+            "plan_hash": plan_hash, "constraint_hash": constraint_hash,
+            "workspace_baseline_hash": baseline_hash,
+        })
         _write_snapshot(self.get(task_id))
         return "approved"
 
@@ -246,7 +358,10 @@ class TaskStore:
         old = self.get(task_id)
         if not old or old["status"] not in TERMINAL_STATES:
             return None
-        reuse_approval = bool(old["task_type"] == "swarm" and old.get("approved_at") and old.get("plan"))
+        if old["task_type"] == "swarm" and not collaboration_handoff_valid(old.get("payload")):
+            return None
+        reuse_approval = bool(old["task_type"] == "swarm" and old.get("approved_at")
+                              and old.get("plan") and approval_receipt_valid(old))
         if reuse_approval and not message_id:
             return None
         retry = self.create(
@@ -257,30 +372,64 @@ class TaskStore:
             approved_at=time.time() if reuse_approval else None,
         )
         if reuse_approval:
+            with _connect() as conn:
+                conn.execute("""UPDATE tasks SET approved_by=?, approval_message_id=?,
+                    plan_hash=?, constraint_hash=?, workspace_baseline_hash=? WHERE id=?""", (
+                    old.get("approved_by"), message_id,
+                    old.get("plan_hash"), old.get("constraint_hash"),
+                    old.get("workspace_baseline_hash"), retry["id"],
+                ))
             record_task_event(retry["id"], "retry_reused_approval", details={"source_task_id": old["id"]})
+            retry = self.get(retry["id"])
+        elif old["task_type"] == "swarm" and old.get("approved_at"):
+            record_task_event(retry["id"], "retry_approval_invalidated",
+                              details={"source_task_id": old["id"]})
         return retry
 
     def recover(self):
         self.expire_approvals()
         now = time.time()
         with _connect() as conn:
-            failed = conn.execute("""SELECT id FROM tasks WHERE status='running'
-                AND task_type='swarm' AND phase='execute' AND cancel_requested=0""").fetchall()
-            conn.execute("""UPDATE tasks SET status='failed', finished_at=?,
-                error='service restarted during workspace write; manual retry required', updated_at=?
-                WHERE status='running' AND task_type='swarm' AND phase='execute' AND cancel_requested=0""", (now, now))
-            replay = conn.execute("""SELECT id FROM tasks WHERE status='running'
-                AND NOT(task_type='swarm' AND phase='execute') AND cancel_requested=0""").fetchall()
-            conn.execute("""UPDATE tasks SET status='queued', started_at=NULL, progress='服务重启后恢复排队',
-                error='interrupted by service restart', updated_at=? WHERE status='running'
-                AND NOT(task_type='swarm' AND phase='execute') AND cancel_requested=0""", (now,))
+            interrupted = conn.execute("""SELECT id, task_type, phase, payload_json FROM tasks WHERE status='running'
+                AND cancel_requested=0""").fetchall()
+            recovery_states = {}
+            for row in interrupted:
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                report_replay = (
+                    row["task_type"] == "swarm" and row["phase"] == "execute"
+                    and payload.get("operation_mode") == "read_only_report"
+                )
+                if row["task_type"] == "swarm" and row["phase"] == "execute" and not report_replay:
+                    conn.execute("""UPDATE tasks SET status='blocked', finished_at=?,
+                        progress='写入阶段被服务重启中断，等待人工重试',
+                        error='interrupted during approved write phase; automatic replay disabled', updated_at=?
+                        WHERE id=?""", (now, now, row["id"]))
+                    recovery_states[row["id"]] = "blocked_write"
+                else:
+                    progress = ("只读报告在服务重启后恢复排队" if report_replay
+                                else "服务重启后恢复排队")
+                    error = ("interrupted by service restart; read-only report will resume idempotently"
+                             if report_replay else
+                             "interrupted by service restart; isolated execution will replay safely")
+                    conn.execute("""UPDATE tasks SET status='queued', started_at=NULL, finished_at=NULL,
+                        progress=?, error=?, updated_at=? WHERE id=?""",
+                        (progress, error, now, row["id"]))
+                    recovery_states[row["id"]] = "requeued_report" if report_replay else "requeued"
             conn.execute("""UPDATE tasks SET status='cancelled', finished_at=?, updated_at=?
                 WHERE status IN ('running','queued') AND cancel_requested=1""", (now, now))
             queued = conn.execute("SELECT id FROM tasks WHERE status='queued' ORDER BY created_at").fetchall()
-        for row in failed:
-            record_task_event(row["id"], "recovery_failed_write", "running", "failed")
-        for row in replay:
-            record_task_event(row["id"], "recovery_requeued", "running", "queued")
+        release_workspace_leases((row["id"] for row in interrupted), db_path=DB_PATH)
+        for row in interrupted:
+            recovery = recovery_states[row["id"]]
+            if recovery == "blocked_write":
+                record_task_event(row["id"], "recovery_blocked_write", "running", "blocked")
+            elif recovery == "requeued_report":
+                record_task_event(row["id"], "recovery_requeued_report", "running", "queued")
+            else:
+                record_task_event(row["id"], "recovery_requeued", "running", "queued")
         return [row["id"] for row in queued]
 
 
@@ -298,6 +447,10 @@ class TaskContext:
     def progress(self, text):
         self.check_cancelled()
         self.store.progress(self.task_id, text)
+
+    def checkpoint(self, name, details=None):
+        self.check_cancelled()
+        self.store.checkpoint(self.task_id, name, details)
 
     def wait_for_approval(self, plan):
         self.check_cancelled()
@@ -319,6 +472,8 @@ class TaskController:
             self._schedule_chat(chat_id)
 
     def submit(self, task_type, chat_id, user_id, message_id, payload):
+        if task_type == "swarm" and not collaboration_handoff_valid(payload):
+            raise ValueError("协作任务必须来自已拍板会议的明确开始协作确认")
         task = self.store.create(task_type, chat_id, user_id, message_id, payload)
         self._schedule_chat(chat_id)
         return task
@@ -329,8 +484,9 @@ class TaskController:
             self._schedule_chat(task["chat_id"])
         return task
 
-    def approve(self, task_id):
-        outcome = self.store.approve(task_id)
+    def approve(self, task_id, approved_by=None, approval_message_id=None):
+        outcome = self.store.approve(task_id, approved_by=approved_by,
+                                     approval_message_id=approval_message_id)
         if outcome == "approved":
             self._schedule_chat(self.store.get(task_id)["chat_id"])
         return outcome
@@ -367,6 +523,10 @@ class TaskController:
             self.store.finish(task_id, "succeeded", result=result)
         except TaskParked:
             pass
+        except TaskNeedsReview as exc:
+            self.store.finish(task_id, "needs_review", result=exc.result, error=str(exc))
+        except TaskBlocked as exc:
+            self.store.finish(task_id, "blocked", result=exc.result, error=str(exc))
         except TaskCancelled as exc:
             self.store.finish(task_id, "cancelled", error=str(exc))
         except Exception as exc:

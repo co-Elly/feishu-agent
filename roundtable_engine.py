@@ -12,6 +12,7 @@ roundtable_engine.py — 圆桌讨论引擎 V2（成熟架构版）
 """
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -19,6 +20,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger("roundtable")
 from agent_runtime import AgentResult, call_antigravity, call_codex, call_hermes, cooldown_seconds
 from task_manager import TaskCancelled
 from settings import get_agents_config, get_summary_config, format_summary_prompt, resolve_style, render_prompt
@@ -231,6 +234,23 @@ AGENTS = get_agents_config()
 ORDER = ["pm", "arch", "dev"]
 MAX_ROUNDS = 4  # 收敛兜底（简单议题可在 2 轮收敛）
 
+
+def meeting_budget(topic):
+    """Choose the smallest useful team and round ceiling from observable task load."""
+    text = str(topic or "")
+    technical = any(token in text.lower() for token in (
+        "代码", "开发", "架构", "接口", "数据库", "迁移", "测试", "安全", "故障",
+        "python", "api", "sql", "agent", "系统", "性能",
+    ))
+    simple = len(text) <= 50 and any(token in text for token in (
+        "命名", "文案", "措辞", "优先级", "是否", "选择", "欢迎语",
+    ))
+    if simple and not technical:
+        return {"agents": ["pm", "dev"], "max_rounds": 2, "load": "low"}
+    if technical or len(text) > 120:
+        return {"agents": list(ORDER), "max_rounds": 4, "load": "high"}
+    return {"agents": list(ORDER), "max_rounds": 3, "load": "medium"}
+
 # 立场关键词（发言强制首行「立场：同意/补充/反对/弃权」）
 STANCE_PAT = re.compile(r"(?:【?立场】?|\*\*立场\*\*)\s*[：:]\s*(同意|赞同|补充|反对|弃权|中立)")
 STANCE_KW = ["同意", "补充", "反对", "弃权"]
@@ -328,8 +348,8 @@ def research_topic(topic, max_lines=12):
                         lines.append(f"- {p}（最近更新 {time.strftime('%m-%d %H:%M', time.localtime(mt))}）")
                     except Exception:
                         lines.append(f"- {p}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("roundtable research: obsidian discovery failed: %s", exc)
     # 1) 聊天记录（最近 2000 行，最多 5 条且清洗换行——控体积防 PM 超时）
     log_path = os.path.join(BASE_DIR, "chat_log.jsonl")
     if os.path.exists(log_path):
@@ -347,8 +367,8 @@ def research_topic(topic, max_lines=12):
                         hits.append(f"[{ts} {dr}] {txt[:100]}")
                 except Exception:
                     pass
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("roundtable research: chat log read failed: %s", exc)
         if hits:
             lines.append("📜 聊天记录相关片段：")
             lines += hits[-5:]
@@ -366,8 +386,8 @@ def research_topic(topic, max_lines=12):
             done = sum(1 for r in rel if r["status"] == "done")
             lines.append(f"🗂 历史会议（同议题 {cnt} 场，收敛 {done} 场）：")
             lines += [f"- {r['created_at']} [{r['status']}] {r['topic'][:60]}" for r in rel[:3]]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("roundtable research: history lookup failed: %s", exc)
     # 3) workspace/ 最近文件
     try:
         ws = os.path.join(BASE_DIR, "workspace")
@@ -379,8 +399,8 @@ def research_topic(topic, max_lines=12):
             )[:8]
             if files:
                 lines.append("📁 workspace/ 最近文件：" + "、".join(files))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("roundtable research: workspace lookup failed: %s", exc)
     if len(lines) <= 1:
         return ""
     return (
@@ -595,11 +615,14 @@ class RoundTableV2:
             on_event("progress", {"round": 0, "msg": "🔎 议题预研中…"})
         # 议题重要性 → 反重力模型档位（贯穿整场会议，start 事件里带出去供飞书显示）
         antigravity_model = "high" if topic_is_important(topic) else "low"
+        budget = meeting_budget(topic)
+        selected_order = budget["agents"]
         if on_event:
             on_event("start", {
                 "session_id": session_id,
                 "topic": topic,
-                "members": [AGENTS[k]["name"] for k in ORDER],
+                "members": [AGENTS[k]["name"] for k in selected_order],
+                "task_load": budget["load"], "max_rounds": budget["max_rounds"],
                 "arch_model": "gemini-3.1-pro-high" if antigravity_model == "high" else "gemini-3.1-pro-low",
                 "arch_level": "质量优先" if antigravity_model == "high" else "快速档",
             })
@@ -607,14 +630,14 @@ class RoundTableV2:
         # 黑板
         transcript = []  # {turn, agent, stance, text, ts}
         stances_history = []  # 每轮的立场 dict
-        active_order = list(ORDER)
+        active_order = list(selected_order)
         unavailable_agents = {}
         round_no = 1
 
         try:
             if cancel_check:
                 cancel_check()
-            while round_no <= MAX_ROUNDS:
+            while round_no <= budget["max_rounds"]:
                 if cancel_check:
                     cancel_check()
                 if round_no == 1:
@@ -738,8 +761,8 @@ class RoundTableV2:
                 )
                 conn.commit()
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("roundtable lifecycle: unable to mark session done: %s", exc)
             return {
                 "session_id": session_id,
                 "topic": topic,
@@ -758,8 +781,8 @@ class RoundTableV2:
                 )
                 conn.commit()
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("roundtable lifecycle: unable to mark session cancelled: %s", exc)
             raise
         except Exception as e:
             try:
@@ -770,8 +793,8 @@ class RoundTableV2:
                 )
                 conn.commit()
                 conn.close()
-            except Exception:
-                pass
+            except Exception as lifecycle_exc:
+                logger.error("roundtable lifecycle: unable to mark session failed: %s", lifecycle_exc)
             raise e
 
     def _read_memory(self, session_id, agent_key):
@@ -789,11 +812,12 @@ class RoundTableV2:
         )
         from swarm_orchestrator import call_llm
         self._calls += 1  # 总结陈词计一次 LLM 调用
-        members_str = "、".join(AGENTS[k]["name"] for k in ORDER)
+        participant_keys = list(dict.fromkeys(t["agent"] for t in transcript)) or list(ORDER)
+        members_str = "、".join(AGENTS[k]["name"] for k in participant_keys)
         summary_cfg = get_summary_config()
         summary_prompt = format_summary_prompt(
             summary_cfg["template"],
-            agent_count=len(ORDER),
+            agent_count=len(participant_keys),
             members=members_str,
             topic=topic,
             all_views=all_views,

@@ -1,0 +1,7 @@
+name: orchestration-feishu
+label: Feishu Orchestration Delegate
+kind: platform
+version: 1.0.0
+description: Keeps Hermes as the sole Feishu gateway and delegates inbound events to the local orchestrator.
+author: local
+
