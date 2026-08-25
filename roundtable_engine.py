@@ -91,6 +91,42 @@ def init_db():
     conn.close()
 
 # ---------------------------------------------------------------- 会话管理
+DEDUP_WINDOW_SECONDS = 600  # 同议题 10 分钟内不重复开会
+
+
+def normalize_topic(topic: str) -> str:
+    """议题归一化：去首尾空白、压缩连续空白，用于同议题去重比较。"""
+    return " ".join((topic or "").split())
+
+
+def find_recent_session(topic, window_seconds=DEDUP_WINDOW_SECONDS):
+    """查找 window_seconds 内同议题（归一化后）且状态为 running/done 的会议。
+
+    返回该 session 的 sqlite Row 或 None。用于 MCP 重试幂等：避免网关超时重试
+    开出多场幽灵会议（历史教训：14 场 cancelled）。
+    """
+    init_db()
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - window_seconds))
+    conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM sessions
+            WHERE status IN ('running', 'done')
+              AND created_at >= ?
+              ORDER BY created_at DESC LIMIT 1
+            """,
+            (cutoff,),
+        ).fetchall()
+        norm = normalize_topic(topic)
+        for r in row:
+            if normalize_topic(r["topic"]) == norm:
+                return r
+        return None
+    finally:
+        conn.close()
+
+
 def create_session(topic):
     init_db()
     session_id = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
@@ -601,6 +637,17 @@ class RoundTableV2:
             self.style_overrides = {}
         # 断点续跑：回收上次崩溃遗留的 running 任务（幂点缓存保证不重复执行）
         reclaim_stale(running_timeout=600, session_timeout=3600)
+        # 同议题去重：10 分钟内同议题已有 running/done 会议 → 直接返回其结果（MCP 重试幂等）
+        recent = find_recent_session(topic)
+        if recent is not None:
+            logger.warning("roundtable dedup: topic %r reuses recent session %s (%s)",
+                           topic, recent["id"], recent["status"])
+            if on_event:
+                on_event("progress", {
+                    "round": 0,
+                    "msg": f"♻️ 检测到 10 分钟内已就同议题开过会（{recent['id']}），直接复用其结果，不再重复开会。",
+                })
+            return self._dedup_result(recent)
         # 先预研再创建本场，避免把刚创建的 running session 误认成历史会议。
         topic_ctx = research_topic(topic)
         if memory_context:
@@ -805,6 +852,35 @@ class RoundTableV2:
                 return f.read()[-2000:]
         except OSError:
             return ""
+
+    def _dedup_result(self, session_row):
+        """从既有会议构造与 run() 相同结构的返回值（不重开会议）。"""
+        sid = session_row["id"]
+        summary = ""
+        minutes_path = os.path.join(session_dir(sid), "minutes.md")
+        try:
+            with open(minutes_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            marker = "## 最终总结\n"
+            if marker in content:
+                summary = content.split(marker, 1)[1].split("\n## ", 1)[0].strip()
+            else:
+                summary = content[-1500:]
+        except OSError:
+            pass
+        if not summary and session_row["state_json"]:
+            try:
+                summary = (json.loads(session_row["state_json"]) or {}).get("last_summary", "")
+            except (ValueError, TypeError):
+                summary = ""
+        return {
+            "session_id": sid,
+            "topic": session_row["topic"],
+            "final_summary": summary or "（该会议尚未产出纪要，请稍后用「任务」查询进度）",
+            "rounds_used": session_row["round"],
+            "unavailable_agents": {},
+            "deduplicated": True,
+        }
 
     def _summarize(self, session_id, topic, transcript, on_event=None):
         all_views = "\n".join(

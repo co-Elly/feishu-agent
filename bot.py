@@ -342,6 +342,69 @@ def reply_feishu_msg(client, message_id, text_content):
         log_chat("out", "bot", text_content)  # 发消息持久化
 
 
+FEISHU_MSG_MAX_LEN = 1800
+
+
+def send_feishu_msg(client, chat_id, text_content, reply_to=None):
+    """发送文本消息（可指定 chat_id 或回复某条消息），返回 msg_id 或 None。
+
+    超过 FEISHU_MSG_MAX_LEN 自动分片，后续片回复前一片形成连贯阅读链。
+    """
+    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+    chunks = [text_content[i:i + FEISHU_MSG_MAX_LEN]
+              for i in range(0, len(text_content), FEISHU_MSG_MAX_LEN)] or [""]
+    last_msg_id = None
+    parent_id = reply_to
+    for idx, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            chunk = f"[{idx + 1}/{len(chunks)}] {chunk}"
+        if parent_id:
+            msg_id = _reply_and_get_msg_id(client, parent_id, chunk)
+        else:
+            req = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": chunk}))
+                    .build()
+                )
+                .build()
+            )
+            resp = client.im.v1.message.create(req)
+            msg_id = resp.data.message_id if resp.success() else None
+            if not resp.success():
+                print(f"[Feishu Send Error] code: {resp.code}, msg: {resp.msg}")
+        if msg_id:
+            log_chat("out", "bot", chunk, chat_id)
+            parent_id = msg_id  # 后续片回复前一片
+            last_msg_id = msg_id
+    return last_msg_id
+
+
+def _reply_and_get_msg_id(client, message_id, text_content):
+    """回复消息并返回新消息的 msg_id（失败返回 None）。"""
+    from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+    req = (
+        ReplyMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(
+            ReplyMessageRequestBody.builder()
+            .msg_type("text")
+            .content(json.dumps({"text": text_content}))
+            .build()
+        )
+        .build()
+    )
+    resp = client.im.v1.message.reply(req)
+    if resp.success():
+        return resp.data.message_id
+    print(f"[Feishu Reply Error] code: {resp.code}, msg: {resp.msg}")
+    return None
+
+
 def send_feishu_file(client, chat_id, file_path):
     from lark_oapi.api.im.v1 import (CreateFileRequest, CreateFileRequestBody,
                                      CreateMessageRequest, CreateMessageRequestBody)
@@ -510,10 +573,12 @@ def _run_roundtable_task(client, task, context):
     chat_id = task["chat_id"]
     card_msg_id = None
     stance_lines = {}
+    last_speech_msg_id = None
     workflow_id = task["payload"].get("workflow_id")
 
     def on_event(event_type, payload):
         nonlocal card_msg_id
+        nonlocal last_speech_msg_id
         context.check_cancelled()
         if event_type == "start":
             members = "、".join(payload["members"])
@@ -532,6 +597,18 @@ def _run_roundtable_task(client, task, context):
                 update_progress_card(client, card_msg_id, "🎙️ 圆桌会议进行中", body)
         elif event_type == "speech":
             stance_lines[payload["agent"]] = payload.get("stance", "中立")
+            # 全文播报：每条发言回复上一条，形成飞书里的连贯讨论链
+            nonlocal last_speech_msg_id
+            speech_text = payload.get("text") or ""
+            if speech_text.strip():
+                header = f"🎙️ {payload['agent']}（第{payload.get('round', '?')}轮 · {payload.get('stance', '中立')}）"
+                sent = send_feishu_msg(
+                    client, chat_id,
+                    f"{header}\n\n{speech_text}",
+                    reply_to=last_speech_msg_id or msg_id,
+                )
+                if sent:
+                    last_speech_msg_id = sent
         elif event_type == "round_end":
             context.progress(f"第 {payload['round']} 轮结束")
             if workflow_id:

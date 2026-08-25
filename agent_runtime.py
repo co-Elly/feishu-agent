@@ -210,7 +210,13 @@ def _run(engine, command, timeout, cwd, input_text=None, extra_env=None):
         detail = diagnostic
         if stdout and stdout != diagnostic:
             detail += f"\n模型输出尾部：{stdout[-400:]}"
-        code, retryable = classify_error(diagnostic)
+        # 退出码非零但模型已产出实质回答时，禁止用回答正文做错误分类——
+        # 正文里出现 "command not found" 等词是模型在讨论问题，不是执行器缺命令。
+        # 只有 stderr（真正的诊断通道）才允许参与 classify_error。
+        if stdout and not stderr:
+            code, retryable = "process_error", False
+        else:
+            code, retryable = classify_error(diagnostic)
         if code == "network" and attempt == 0:
             continue
         return _result(engine, started, False, f"{ERROR_LABELS[code]}: {detail[-600:]}", code, retryable)
@@ -249,7 +255,33 @@ def call_hermes(task_text, timeout=300):
     return _run("hermes", command, timeout, BASE_DIR)
 
 
+WRITE_INTENT_PAT = re.compile(
+    r"(写入|写入到|保存到|保存为|新建|创建|创建文件|修改|编辑|删除|覆盖|更新)"
+    r"[^。\n]{0,60}?\.(py|js|ts|json|yaml|yml|md|txt|toml|cfg|ini|bat|ps1|sh|html|css|csv)\b"
+    r"|(?:write|create|modify|edit|update|save)[\w\s]{0,30}\b(?:to\b)?[\w\-./\\]*\.\w{1,5}",
+    re.I,
+)
+
+
+def detect_write_intent(task_text):
+    """检测任务书是否包含明确的“写文件”意图（动词 + 文件名）。
+
+    agy headless/plan 模式无法授予写权限，含写意图的任务必须走协作 staging 流程，
+    提前拦截避免整单执行到一半才报 write_file permission 错误。
+    """
+    if not task_text:
+        return False
+    return bool(WRITE_INTENT_PAT.search(task_text))
+
+
 def call_antigravity(task_text, timeout=200, model="low", workspace_dir=None):
+    if detect_write_intent(task_text):
+        return _result(
+            "antigravity", time.monotonic(), False,
+            "任务包含写文件意图：agy 以 plan 模式运行且 headless 下无法提示授权。"
+            "请通过「协作 <目标>」流程在 staging 工作区执行，或改派 Codex（workspace-write）。",
+            "write_intent_requires_staging", False,
+        )
     task_file = isolated_prompt_file("agy_", task_text)
     if task_file.startswith("/mnt/"):
         drive = task_file[5].upper()

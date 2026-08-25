@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import ntpath
 import re
 import sys
 import tempfile
@@ -418,6 +419,29 @@ def _expand(value):
     return os.environ.get(match.group(1), "") if match else os.path.expandvars(value)
 
 
+def _is_inside_base_dir(path):
+    """判断 path 是否位于 BASE_DIR 内。
+
+    POSIX 上 Windows 风格绝对路径（E:\\...）经 os.path.abspath 会错误地拼进项目内，
+    这里先识别 Windows 绝对路径并直接视为项目外（跨盘必然隔离）。
+    """
+    if not path:
+        return False
+    if ntpath.isabs(path) and not os.path.isabs(path):
+        return False  # Windows 盘符路径，与 WSL 项目目录天然隔离
+    try:
+        return os.path.commonpath([BASE_DIR, os.path.abspath(path)]) == BASE_DIR
+    except ValueError:
+        return False
+
+
+def _safe_abspath(path):
+    """POSIX 上不破坏 Windows 风格绝对路径（E:\\... 保持原样）。"""
+    if path and ntpath.isabs(path) and not os.path.isabs(path):
+        return path
+    return os.path.abspath(path)
+
+
 @lru_cache(maxsize=1)
 def load_config():
     try:
@@ -433,24 +457,14 @@ def load_config():
                 section[key] = _expand(value)
     runtime = dict(RUNTIME_DEFAULTS)
     runtime.update(config.get("runtime") or {})
-    runtime["workspace_dir"] = os.path.abspath(runtime["workspace_dir"])
-    runtime["execution_dir"] = os.path.abspath(runtime["execution_dir"])
-    runtime["antigravity_service_profile"] = os.path.abspath(
+    runtime["workspace_dir"] = _safe_abspath(runtime["workspace_dir"])
+    runtime["execution_dir"] = _safe_abspath(runtime["execution_dir"])
+    runtime["antigravity_service_profile"] = _safe_abspath(
         runtime["antigravity_service_profile"]
     )
-    try:
-        nested_execution = os.path.commonpath([BASE_DIR, runtime["execution_dir"]]) == BASE_DIR
-    except ValueError:
-        nested_execution = False
-    if nested_execution:
+    if _is_inside_base_dir(runtime["execution_dir"]):
         raise ConfigError("execution_dir 必须位于主项目目录之外，避免沙箱识别到真实仓库")
-    try:
-        nested_profile = os.path.commonpath(
-            [BASE_DIR, runtime["antigravity_service_profile"]]
-        ) == BASE_DIR
-    except ValueError:
-        nested_profile = False
-    if nested_profile:
+    if _is_inside_base_dir(runtime["antigravity_service_profile"]):
         raise ConfigError("antigravity_service_profile 必须位于主项目目录之外")
     config["runtime"] = runtime
     return config

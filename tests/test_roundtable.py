@@ -5,6 +5,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+
 import roundtable_engine as re_
 
 
@@ -132,6 +134,79 @@ def test_fixed_point_not_on_round2_first_change():
     prev = {"pm": "补充", "arch": "补充"}
     now = {"pm": "补充", "arch": "反对"}
     assert re_.meeting_converged(2, now, prev) == (False, "running")
+
+
+# ---------------- P0-2 同议题去重 ----------------
+
+@pytest.fixture()
+def _rt_db(tmp_path, monkeypatch):
+    """把 roundtable DB/黑板目录指到临时路径（只改模块全局，不重载模块，
+    避免污染其他测试看到的 DB_PATH）。"""
+    rt = tmp_path / "roundtable"
+    db = str(rt / "roundtable.db")
+    monkeypatch.setattr(re_, "RT_ROOT", str(rt))
+    monkeypatch.setattr(re_, "DB_PATH", db)
+    yield re_
+
+
+def test_normalize_topic_strips_whitespace():
+    assert re_.normalize_topic("  讨论   圆桌引擎  ") == "讨论 圆桌引擎"
+    assert re_.normalize_topic("") == ""
+    assert re_.normalize_topic(None) == ""
+
+
+def test_normalize_topic_fullwidth_space():
+    assert re_.normalize_topic("议题\u3000\u3000A") == "议题 A"
+
+
+def test_find_recent_session_dedups_same_topic(_rt_db):
+    r = _rt_db
+    sid = r.create_session("讨论 圆桌引擎升级")
+    hit = r.find_recent_session("  讨论   圆桌引擎升级  ")  # 空白差异不影响命中
+    assert hit is not None and hit["id"] == sid
+
+
+def test_find_recent_session_ignores_different_topic(_rt_db):
+    r = _rt_db
+    r.create_session("议题甲")
+    assert r.find_recent_session("议题乙") is None
+
+
+def test_find_recent_session_ignores_cancelled(_rt_db):
+    import sqlite3 as _sq
+    from roundtable_engine import DB_PATH as _db
+    r = _rt_db
+    sid = r.create_session("旧议题")
+    conn = _sq.connect(_db)
+    conn.execute("UPDATE sessions SET status='cancelled' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    assert r.find_recent_session("旧议题") is None
+
+
+def test_find_recent_session_window_expiry(_rt_db, monkeypatch):
+    import sqlite3 as _sq
+    from roundtable_engine import DB_PATH as _db
+    r = _rt_db
+    sid = r.create_session("过期议题")
+    old = "2000-01-01 00:00:00"
+    conn = _sq.connect(_db)
+    conn.execute("UPDATE sessions SET created_at=? WHERE id=?", (old, sid))
+    conn.commit(); conn.close()
+    assert r.find_recent_session("过期议题") is None
+
+
+def test_dedup_result_reads_minutes(_rt_db):
+    import os as _os
+    from roundtable_engine import session_dir as _sd
+    r = _rt_db
+    sid = r.create_session("有纪要的议题")
+    _os.makedirs(_sd(sid), exist_ok=True)
+    with open(_os.path.join(_sd(sid), "minutes.md"), "w", encoding="utf-8") as f:
+        f.write("# 纪要\n\n## 最终总结\n共识是好的。\n\n## 完整记录\n略\n")
+    row = r.find_recent_session("有纪要的议题")
+    res = r.roundtable_v2._dedup_result(row) if hasattr(r.roundtable_v2, "_dedup_result") else r.RoundTableV2()._dedup_result(row)
+    assert res["deduplicated"] is True
+    assert "共识是好的" in res["final_summary"]
 
 
 if __name__ == "__main__":

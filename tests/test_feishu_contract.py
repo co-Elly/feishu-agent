@@ -457,8 +457,9 @@ def test_failed_swarm_surfaces_final_validation_report(monkeypatch):
         bot._run_swarm_task(None, task, context)
 
 
-def test_roundtable_speech_only_updates_one_card(monkeypatch):
-    replies, updates, cards, memories = [], [], [], []
+def test_roundtable_speech_broadcasts_full_text_as_reply_chain(monkeypatch):
+    """P0-1 新契约：speech 全文通过 send_feishu_msg 播报，且首条回复原消息形成回复链。"""
+    replies, updates, cards, sent, memories = [], [], [], [], []
 
     class Context:
         def check_cancelled(self): pass
@@ -468,8 +469,7 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
         def run(self, topic, **kwargs):
             event = kwargs["on_event"]
             event("start", {"members": ["A", "B", "C"]})
-            event("speech", {"agent": "A", "stance": "同意", "text": "不应单独发出的正文"})
-            event("progress", {"msg": "第二轮"})
+            event("speech", {"agent": "A", "stance": "同意", "text": "第一轮发言正文"})
             return {"session_id": "s1", "rounds_used": 2, "final_summary": "最终总结",
                     "unavailable_agents": {}}
 
@@ -478,6 +478,8 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
                         cards.append((args, kwargs)) or "card-1")
     monkeypatch.setattr(bot, "update_progress_card", lambda *args, **kwargs: updates.append(args) or True)
     monkeypatch.setattr(bot, "reply_feishu_msg", lambda client, message_id, text: replies.append(text))
+    monkeypatch.setattr(bot, "send_feishu_msg",
+                        lambda client, chat_id, text, reply_to=None: sent.append((chat_id, text, reply_to)) or "s-1")
     monkeypatch.setattr(bot, "_evolve_after_task", lambda *args: {
         "id": "evo12345", "content": "先验证现状再修改",
     })
@@ -485,17 +487,18 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
         prompt_context=lambda *args, **kwargs: "",
         add=lambda *args, **kwargs: memories.append((args, kwargs)),
     ))
-    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO("# 会议纪要\n完整内容"))
+    import io as _io
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: _io.StringIO("# 会议纪要\n完整内容"))
     task = {"id": "t1", "task_type": "roundtable",
-            "payload": {"topic": "欢迎语", "project": "飞书机器人",
-                        "constraint_envelope": {
-                            "version": 1, "root_request": "欢迎语", "hard_constraints": [],
-                            "scope_restricted": False, "allowed_paths": [],
-                        }},
+            "payload": {"topic": "欢迎会", "project": "项目记忆",
+                        "constraint_envelope": {"root_request": "欢迎会"}},
             "message_id": "m1", "chat_id": "c1"}
     bot._run_roundtable_task(None, task, Context())
-    assert all("不应单独发出的正文" not in reply for reply in replies)
-    assert replies == []
+    # 全文已播报，且回复原消息 m1 形成回复链
+    assert len(sent) == 1
+    chat_id, text, reply_to = sent[0]
+    assert chat_id == "c1" and reply_to == "m1"
+    assert "第一轮发言正文" in text and "A" in text
     assert len(cards) == 2
     assert cards[1][1]["details_text"].startswith("# 会议纪要")
     assert updates and any("最终总结" in str(args) for args in updates)
@@ -503,7 +506,7 @@ def test_roundtable_speech_only_updates_one_card(monkeypatch):
     assert all("确认请回复 `开始协作" not in str(args) for args in updates)
     assert any("本次进化" in str(args) for args in updates)
     assert memories == [(('最终总结',), {
-        "project_name": "飞书机器人", "source_type": "roundtable",
+        "project_name": "项目记忆", "source_type": "roundtable",
         "source_id": "t1", "source_path": "roundtable/s1/minutes.md",
     })]
 
