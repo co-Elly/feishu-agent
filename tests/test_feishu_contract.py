@@ -611,3 +611,72 @@ def test_meaningful_task_learns_one_auditable_evolution_rule(monkeypatch):
     assert added == [("先验证现状再修改", "task-1", "A")]
     assert "不得猜测未出现的错误类别" in prompts[0]
     assert any(args[1] == "evolution_learned" for args, _ in events)
+
+
+# ---------------- P1 飞书限流退避 ----------------
+
+class _FakeResp:
+    def __init__(self, code=None, success=None, message_id="msg-x"):
+        self._success = (code is None)
+        self.code = code
+        self.msg = "err"
+        if success is not None:
+            self._success = success
+    def success(self):
+        return self._success
+
+
+def test_feishu_retry_backs_off_rate_limit(monkeypatch):
+    """99991663 限流 → 按 1/2/4s 退避重试，第三次成功。"""
+    import bot as _bot
+    sleeps = []
+    monkeypatch.setattr(_bot.time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+    def send_fn():
+        calls["n"] += 1
+        return _FakeResp() if calls["n"] >= 3 else _FakeResp(code=99991663)
+    resp = _bot._feishu_call_with_retry(send_fn)
+    assert resp.success()
+    assert calls["n"] == 3
+    assert sleeps == [1, 2]
+
+
+def test_feishu_retry_frequency_backoff(monkeypatch):
+    """99991668 频控 → 固定 30s 退避一次。"""
+    import bot as _bot
+    sleeps = []
+    monkeypatch.setattr(_bot.time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+    def send_fn():
+        calls["n"] += 1
+        return _FakeResp() if calls["n"] >= 2 else _FakeResp(code=99991668)
+    resp = _bot._feishu_call_with_retry(send_fn)
+    assert resp.success()
+    assert sleeps == [30]
+
+
+def test_feishu_retry_exhausted_returns_last(monkeypatch):
+    """退避耗尽仍失败 → 返回最后一次失败响应，不抛异常。"""
+    import bot as _bot
+    monkeypatch.setattr(_bot.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+    def send_fn():
+        calls["n"] += 1
+        return _FakeResp(code=99991663)
+    resp = _bot._feishu_call_with_retry(send_fn)
+    assert not resp.success()
+    assert calls["n"] == 4  # 首发 + 3 次退避重试
+
+
+def test_feishu_no_retry_on_other_errors(monkeypatch):
+    """非限流错误码不重试，立即返回。"""
+    import bot as _bot
+    sleeps = []
+    monkeypatch.setattr(_bot.time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+    def send_fn():
+        calls["n"] += 1
+        return _FakeResp(code=230001)
+    resp = _bot._feishu_call_with_retry(send_fn)
+    assert not resp.success()
+    assert calls["n"] == 1 and sleeps == []

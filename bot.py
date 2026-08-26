@@ -322,6 +322,32 @@ def chat_with_hermes(user_id, user_prompt, project_name=None):
     return result
 
 
+# ---------------- 飞书 API 限流退避（P1） ----------------
+FEISHU_RATE_LIMIT_CODE = 99991663     # 触发限流 → 指数退避 1/2/4s 重试
+FEISHU_FREQUENCY_CODE = 99991668      # 发送频率超限 → 固定退避 30s 重试一次
+_FEISHU_RETRY_DELAYS = {FEISHU_RATE_LIMIT_CODE: [1, 2, 4], FEISHU_FREQUENCY_CODE: [30]}
+
+
+def _feishu_call_with_retry(send_fn):
+    """执行 send_fn() 并对飞书限流/频控错误码自动退避重试。
+
+    send_fn 返回 resp；resp.success() 为 False 且 code 命中退避表时按表内
+    延迟序列 sleep 后重发，耗尽次数仍失败则返回最后一次 resp。
+    """
+    resp = send_fn()
+    if resp is not None and resp.success():
+        return resp
+    code = getattr(resp, "code", None)
+    delays = _FEISHU_RETRY_DELAYS.get(code)
+    for delay in delays or []:
+        print(f"[Feishu Retry] code={code}, backing off {delay}s")
+        time.sleep(delay)
+        resp = send_fn()
+        if resp is not None and resp.success():
+            return resp
+    return resp
+
+
 def reply_feishu_msg(client, message_id, text_content):
     """向飞书用户回复消息"""
     req = (
@@ -335,7 +361,7 @@ def reply_feishu_msg(client, message_id, text_content):
         )
         .build()
     )
-    resp = client.im.v1.message.reply(req)
+    resp = _feishu_call_with_retry(lambda: client.im.v1.message.reply(req))
     if not resp.success():
         print(f"[Feishu Reply Error] code: {resp.code}, msg: {resp.msg}")
     else:
@@ -373,7 +399,7 @@ def send_feishu_msg(client, chat_id, text_content, reply_to=None):
                 )
                 .build()
             )
-            resp = client.im.v1.message.create(req)
+            resp = _feishu_call_with_retry(lambda: client.im.v1.message.create(req))
             msg_id = resp.data.message_id if resp.success() else None
             if not resp.success():
                 print(f"[Feishu Send Error] code: {resp.code}, msg: {resp.msg}")
@@ -398,7 +424,7 @@ def _reply_and_get_msg_id(client, message_id, text_content):
         )
         .build()
     )
-    resp = client.im.v1.message.reply(req)
+    resp = _feishu_call_with_retry(lambda: client.im.v1.message.reply(req))
     if resp.success():
         return resp.data.message_id
     print(f"[Feishu Reply Error] code: {resp.code}, msg: {resp.msg}")
@@ -476,7 +502,7 @@ def send_progress_card(client, receive_id, title, body_text, details_text=None):
         )
         .build()
     )
-    resp = client.im.v1.message.create(req)
+    resp = _feishu_call_with_retry(lambda: client.im.v1.message.create(req))
     if resp.success():
         msg = resp.data.message_id
         print(f"[Feishu Card Created] msg_id={msg}")
@@ -499,7 +525,7 @@ def update_progress_card(client, message_id, title, body_text):
         )
         .build()
     )
-    resp = client.im.v1.message.patch(req)
+    resp = _feishu_call_with_retry(lambda: client.im.v1.message.patch(req))
     if not resp.success():
         print(f"[Feishu Card Update Error] code: {resp.code}, msg: {resp.msg}")
     return resp.success()
