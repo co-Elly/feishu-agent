@@ -17,7 +17,8 @@ class MemoryStore:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        from sqlite_compat import set_journal_mode
+        set_journal_mode(conn)
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 

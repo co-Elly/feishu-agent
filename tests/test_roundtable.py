@@ -268,6 +268,16 @@ def test_meeting_converged_backward_compat():
     assert re_.meeting_converged(2, {"pm": "同意"}, None) == (True, "consensus")
 
 
+# ---------------- P3c 周报统计 ----------------
+
+def test_weekly_stats_shape(_rt_db):
+    """weekly_stats 返回三段结构且不炸（空库/缺表安全）。"""
+    import task_manager as tm
+    stats = tm.TaskStore().weekly_stats(days=7)
+    assert set(stats.keys()) == {"by_type", "engines", "meetings"}
+    assert isinstance(stats["by_type"], dict)
+
+
 if __name__ == "__main__":
     # 无 pytest 时也能直接跑
     import traceback

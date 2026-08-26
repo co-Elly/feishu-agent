@@ -43,7 +43,11 @@ def _conn():
     ensure_dir(RT_ROOT)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    try:
+        from sqlite_compat import set_journal_mode
+        set_journal_mode(conn)
+    except sqlite3.OperationalError:
+        conn.execute("PRAGMA journal_mode=DELETE;")
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 

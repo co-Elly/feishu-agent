@@ -10,7 +10,8 @@ from conversation_store import DB_PATH
 def _connect(db_path=None):
     conn = sqlite3.connect(db_path or DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    from sqlite_compat import set_journal_mode
+    set_journal_mode(conn)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("""CREATE TABLE IF NOT EXISTS engine_health (
         engine TEXT PRIMARY KEY, available INTEGER NOT NULL DEFAULT 0,

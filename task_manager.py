@@ -22,6 +22,13 @@ ACTIVE_STATES = {"queued", "running", "waiting_approval"}
 WORKSPACE_WRITE_LOCK = threading.Lock()
 
 
+def _table_exists(conn, table, column=None):
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if not cols:
+        return False
+    return column is None or column in cols
+
+
 def collaboration_handoff_valid(payload):
     """A swarm task exists only after an owner explicitly confirms a meeting handoff."""
     payload = payload or {}
@@ -109,7 +116,8 @@ def _connect():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        from sqlite_compat import set_journal_mode
+        set_journal_mode(conn)
     except sqlite3.OperationalError as exc:
         if "locked" not in str(exc).lower():
             raise
@@ -231,6 +239,38 @@ class TaskStore:
         with _connect() as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {row["status"]: row["n"] for row in rows}
+
+    def weekly_stats(self, days=7):
+        """P3c 周报统计：近 N 天任务成功率（按类型）+ 引擎耗时分布。"""
+        cutoff = time.time() - days * 86400
+        with _connect() as conn:
+            by_type = conn.execute(
+                """SELECT task_type, status, COUNT(*) AS n FROM tasks
+                   WHERE created_at >= ? AND task_type != 'chat'
+                   GROUP BY task_type, status""",
+                (cutoff,),
+            ).fetchall()
+            durations = conn.execute(
+                """SELECT engine, COUNT(*) AS n, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms
+                   FROM trace_spans
+                   WHERE created_at >= ? AND duration_ms IS NOT NULL
+                   GROUP BY engine""",
+                (cutoff,),
+            ).fetchall() if _table_exists(conn, "trace_spans", "duration_ms") else []
+            meetings = conn.execute(
+                """SELECT status, COUNT(*) AS n FROM sessions
+                   WHERE created_at >= datetime(?, 'unixepoch')
+                   GROUP BY status""",
+                (cutoff,),
+            ).fetchall() if _table_exists(conn, "sessions") else []
+        stats = {"by_type": {}, "engines": [], "meetings": {}}
+        for row in by_type:
+            stats["by_type"].setdefault(row["task_type"], {})[row["status"]] = row["n"]
+        for row in durations:
+            stats["engines"].append(dict(row))
+        for row in meetings:
+            stats["meetings"][row["status"]] = row["n"]
+        return stats
 
     def next_queued(self, chat_id):
         with _connect() as conn:

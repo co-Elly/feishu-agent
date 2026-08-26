@@ -18,7 +18,8 @@ _LOCK = threading.RLock()
 def _connect():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
+    from sqlite_compat import set_journal_mode
+    set_journal_mode(conn)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("""CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

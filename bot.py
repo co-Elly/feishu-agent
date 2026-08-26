@@ -1202,6 +1202,30 @@ def handle_message(client, data: P2ImMessageReceiveV1):
             reply_feishu_msg(client, msg_id, f"✅ 已收到，深度健康任务 {task['id']} 已在后台排队。")
             return
 
+        # P3c 周报：近 7 天任务成功率 + 引擎耗时 + 会议统计
+        if lower_text in ["周报", "weekly", "weekly report"]:
+            stats = TASK_CONTROLLER.store.weekly_stats(days=7)
+            lines = ["📈【周报 · 近7天】", "-------------------------"]
+            for ttype, status_counts in stats["by_type"].items():
+                total = sum(status_counts.values())
+                ok = status_counts.get("succeeded", 0)
+                rate = f"{ok / total * 100:.0f}%" if total else "-"
+                parts = " ".join(f"{k}:{v}" for k, v in sorted(status_counts.items()))
+                lines.append(f"• {ttype}: {ok}/{total} 成功（{rate}） [{parts}]")
+            if not stats["by_type"]:
+                lines.append("• 本周无任务记录")
+            if stats["engines"]:
+                lines.append("-------------------------")
+                for e in stats["engines"]:
+                    avg_s = (e["avg_ms"] or 0) / 1000
+                    max_s = (e["max_ms"] or 0) / 1000
+                    lines.append(f"⚙️ {e['engine']}: {e['n']} 次 · 平均 {avg_s:.1f}s · 最长 {max_s:.1f}s")
+            meeting_line = " · ".join(f"{k}:{v}" for k, v in sorted(stats["meetings"].items()))
+            if meeting_line:
+                lines.append(f"🎙️ 圆桌会议: {meeting_line}")
+            reply_feishu_msg(client, msg_id, "\n".join(lines))
+            return
+
         # 项目标签不参与命令路由，避免项目名中的“会议”误触发圆桌。
         tagged_text, project = extract_project_tag(clean_text)
         command_text = tagged_text.strip()
