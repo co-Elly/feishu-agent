@@ -12,6 +12,8 @@ if (-not [string]::IsNullOrWhiteSpace($userOpenAIKey)) {
     $env:OPENAI_API_KEY = $userOpenAIKey
 }
 $env:FEISHU_MAX_WORKERS = "4"
+# P4: Codex quota exhausted (resets 22:50) - run roundtable as pm+arch duo until re-enabled.
+$env:FEISHU_ROUNDTABLE_ORDER = "pm,arch"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUNBUFFERED = "1"
 $projectDir = $PSScriptRoot

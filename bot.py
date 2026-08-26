@@ -713,6 +713,11 @@ def _run_roundtable_task(client, task, context):
     if evolution and card_msg_id:
         update_progress_card(client, card_msg_id, "✅ 圆桌会议完成",
                              final_body + f"\n\n🧬 **本次进化**：{evolution['content']}（ID {evolution['id']}）")
+    TASK_CONTROLLER.store.finish(task["id"], "succeeded", result={
+        "session_id": result["session_id"],
+        "rounds_used": result["rounds_used"],
+        "summary": result["final_summary"],
+    })
     return {"session_id": result["session_id"], "rounds": result["rounds_used"],
             "summary": result["final_summary"], "unavailable_agents": result.get("unavailable_agents", {}),
             "evolution_memory_id": evolution["id"] if evolution else None}

@@ -1,0 +1,41 @@
+{
+  "id": "5a5d531baf",
+  "task_type": "swarm",
+  "status": "failed",
+  "chat_id": "test_chat_001",
+  "user_id": "test_user_001",
+  "message_id": "msg_3",
+  "error": "TypeError: 'NoneType' object is not callable",
+  "progress": "正在执行本地确定性报告预检；批准前不调用 Agent",
+  "work_dir": "E:\\feishu-agent\\workspace/tasks/5a5d531baf",
+  "retry_of": null,
+  "attempt": 1,
+  "cancel_requested": false,
+  "created_at": 1787760193.2258472,
+  "started_at": 1787760193.267821,
+  "finished_at": 1787760193.2851238,
+  "updated_at": 1787760193.3275082,
+  "phase": "planning",
+  "approval_expires_at": null,
+  "approved_at": null,
+  "approved_by": null,
+  "approval_message_id": null,
+  "plan_hash": null,
+  "constraint_hash": null,
+  "workspace_baseline_hash": null,
+  "payload": {
+    "goal": "测试 E2E 流程",
+    "workflow_id": "wf_94593f08b4af",
+    "meeting_task_id": "3aacc5910b",
+    "collaboration_confirmation": {
+      "confirmed_by": "test_user_001",
+      "confirmation_message_id": "msg_3",
+      "workflow_id": "wf_94593f08b4af",
+      "meeting_task_id": "3aacc5910b",
+      "confirmed_at": 1787760193.2258074
+    },
+    "operation_mode": "read_only_report"
+  },
+  "result": null,
+  "plan": null
+}

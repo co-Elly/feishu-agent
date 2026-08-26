@@ -1,0 +1,41 @@
+{
+  "id": "0553d796f8",
+  "task_type": "swarm",
+  "status": "queued",
+  "chat_id": "test_chat_001",
+  "user_id": "test_user_001",
+  "message_id": "msg_3",
+  "error": null,
+  "progress": null,
+  "work_dir": "E:\\feishu-agent\\workspace/tasks/0553d796f8",
+  "retry_of": null,
+  "attempt": 1,
+  "cancel_requested": false,
+  "created_at": 1787760754.6369033,
+  "started_at": null,
+  "finished_at": null,
+  "updated_at": 1787760754.6369033,
+  "phase": "planning",
+  "approval_expires_at": null,
+  "approved_at": null,
+  "approved_by": null,
+  "approval_message_id": null,
+  "plan_hash": null,
+  "constraint_hash": null,
+  "workspace_baseline_hash": null,
+  "payload": {
+    "goal": "测试 E2E 流程",
+    "workflow_id": "wf_c24ab2db3bf3",
+    "meeting_task_id": "ef0a73e8b0",
+    "collaboration_confirmation": {
+      "confirmed_by": "test_user_001",
+      "confirmation_message_id": "msg_3",
+      "workflow_id": "wf_c24ab2db3bf3",
+      "meeting_task_id": "ef0a73e8b0",
+      "confirmed_at": 1787760754.6368089
+    },
+    "operation_mode": "read_only_report"
+  },
+  "result": null,
+  "plan": null
+}

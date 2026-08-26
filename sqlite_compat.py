@@ -21,6 +21,15 @@ def set_journal_mode(conn, mode="WAL"):
     except sqlite3.OperationalError as exc:
         low = str(exc).lower()
         if any(m in low for m in _WAL_UNSUPPORTED_MARKERS) and mode.upper() == "WAL":
-            conn.execute("PRAGMA journal_mode=DELETE")
-            return "delete"
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE")
+                return "delete"
+            except sqlite3.OperationalError:
+                # Both WAL and DELETE fail (e.g. drvfs with WAL held by Windows process).
+                # Return whatever the connection defaulted to.
+                try:
+                    row = conn.execute("PRAGMA journal_mode").fetchone()
+                    return (row[0] if row else "delete").lower()
+                except Exception:
+                    return "delete"
         raise

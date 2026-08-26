@@ -271,7 +271,10 @@ def pending_turns(session_id, round_no):
 # ---------------------------------------------------------------- 团队配置（支持 config.json 动态配置与风格预设）
 AGENTS = get_agents_config()
 # 圆桌参会阵容：Hermes + 反重力 + Codex
-ORDER = ["pm", "arch", "dev"]
+# 可用 FEISHU_ROUNDTABLE_ORDER 覆盖（逗号分隔），如临时双人局：
+#   FEISHU_ROUNDTABLE_ORDER=pm,arch   （Codex 额度耗尽/通道故障时）
+_order_env = os.environ.get("FEISHU_ROUNDTABLE_ORDER", "")
+ORDER = [k.strip() for k in _order_env.split(",") if k.strip() in AGENTS] or ["pm", "arch", "dev"]
 MAX_ROUNDS = 4  # 收敛兜底（简单议题可在 2 轮收敛）
 
 

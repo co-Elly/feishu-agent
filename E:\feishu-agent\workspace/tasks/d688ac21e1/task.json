@@ -1,0 +1,45 @@
+{
+  "id": "d688ac21e1",
+  "task_type": "roundtable",
+  "status": "succeeded",
+  "chat_id": "test_chat_001",
+  "user_id": "test_user_001",
+  "message_id": "test_msg_001",
+  "error": null,
+  "progress": "会议完成，正在执行一次任务后进化复盘",
+  "work_dir": "E:\\feishu-agent\\workspace/tasks/d688ac21e1",
+  "retry_of": null,
+  "attempt": 1,
+  "cancel_requested": false,
+  "created_at": 1787760658.9054484,
+  "started_at": 1787760658.9435773,
+  "finished_at": 1787760659.1672523,
+  "updated_at": 1787760659.1672523,
+  "phase": "execute",
+  "approval_expires_at": null,
+  "approved_at": null,
+  "approved_by": null,
+  "approval_message_id": null,
+  "plan_hash": null,
+  "constraint_hash": null,
+  "workspace_baseline_hash": null,
+  "payload": {
+    "topic": "测试 E2E 流程",
+    "root_request": "测试 E2E 流程",
+    "workflow_id": null,
+    "constraint_envelope": {
+      "version": 1,
+      "root_request": "测试",
+      "hard_constraints": [],
+      "scope_restricted": false,
+      "allowed_paths": []
+    },
+    "initiated_by": "test"
+  },
+  "result": {
+    "session_id": "test_e2e_session",
+    "rounds_used": 2,
+    "summary": "全员同意执行"
+  },
+  "plan": null
+}
