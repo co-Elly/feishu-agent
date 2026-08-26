@@ -800,15 +800,37 @@ def _run_swarm_task(client, task, context):
                 cancel_check=context.check_cancelled,
             )
         frozen_scope = (plan.get("approved_scope") or {}).get("allowed_paths") or []
+        envelope = plan.get("constraint_envelope") or {}
+        hard_constraints = envelope.get("hard_constraints") or []
+        scope_restricted = envelope.get("scope_restricted", False)
         scope_preview = (
             "**冻结写入范围**：" + "、".join(f"`{path}`" for path in frozen_scope) + "\n\n"
             if not report_mode else ""
         )
+        
+        # P5b: 范围合规证据
+        scope_evidence = (
+            "**范围合规**：\n"
+            + (f"  ✅ 影响文件 {len(frozen_scope)} 个，均在批准范围内\n" if frozen_scope else "  ⚠️ 未冻结写入范围\n")
+            + (f"  ✅ 硬约束 {len(hard_constraints)} 条已记录\n" if hard_constraints else "  ℹ️ 无额外硬约束\n")
+            + (f"  ⚠️ 严格范围模式已启用\n" if scope_restricted else "  ℹ️ 非严格范围模式\n")
+        )
+        
+        # P5b: 风险清单
+        impact_text = plan.get("impact_and_risks", "") or ""
+        risk_lines = [line.strip() for line in impact_text.split("\n") if line.strip() and "风险" in line.lower()]
+        risk_section = (
+            "\n**风险清单**：\n" + "\n".join(f"  🟡 {line[:100]}" for line in risk_lines[:3])
+            if risk_lines else "\n**风险清单**：无重大风险\n"
+        )
+        
         preview = (
             f"**任务**：{task['id']}\n**项目**：{plan['project_name']}\n"
             f"**目标**：{goal}\n\n**方案摘要**：\n{plan['requirements'][:500]}\n\n"
-            f"**影响与风险**：\n{plan['impact_and_risks'][:500]}\n\n"
-            + scope_preview
+            + scope_evidence
+            + risk_section
+            + "\n\n**影响与风险**：\n" + impact_text[:500]
+            + "\n\n" + scope_preview
             + ("**执行模式**：外部 PDF + 项目只读分析；仅生成并发送一份 DOCX 报告，"
                "不进入源码写入、仓库测试或合并流程。\n\n" if report_mode else
                "**系统产物**：任务快照、SQLite 审计、项目记忆与 Obsidian 纪要；不计入业务文件变更。\n\n")

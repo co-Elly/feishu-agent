@@ -76,18 +76,27 @@ DEFAULT_AGENTS = {
         "engine": "hermes",
         "role": "你是产品经理兼会议主持人（Hermes 主脑真身）。你负责：把控讨论方向、评估意见、推动共识、最后向老板汇报。你关注需求价值、用户视角与落地优先级。",
         "style": "言简意赅，善于总结和引导。",
+        "temperature": 0.7,
+        "confidence_threshold": 0.6,
+        "max_output_tokens": 2000,
     },
     "arch": {
         "name": "📐 反重力·架构师",
         "engine": "antigravity",
         "role": "你是一位首席系统架构师（代号反重力）。你负责：系统架构、数据流、模块划分、接口契约与技术选型。你关注高内聚低耦合、可扩展性与工程可行性。",
         "style": "结构化表达，给出模块/接口层面的专业意见。",
+        "temperature": 0.3,
+        "confidence_threshold": 0.7,
+        "max_output_tokens": 3000,
     },
     "dev": {
         "name": "💻 Codex·核心工程师",
         "engine": "codex",
         "role": "你是 Codex 核心工程师。你负责代码实现方案、可运行性、性能、安全与测试验证。",
         "style": "给出可落地的技术方案与实现要点。",
+        "temperature": 0.5,
+        "confidence_threshold": 0.5,
+        "max_output_tokens": 4000,
     },
 }
 

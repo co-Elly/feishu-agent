@@ -131,14 +131,27 @@ class MemoryStore:
             return rows
 
         with self._connect() as conn:
+            # 进化规则（全局 + 项目）
             global_evolution = [dict(row) for row in conn.execute("""SELECT * FROM memories
                 WHERE scope='global' AND source_type='evolution'
                 ORDER BY created_at DESC LIMIT 1""").fetchall()]
             project_evolution = [dict(row) for row in conn.execute("""SELECT * FROM memories
                 WHERE scope='project' AND project_name=? AND source_type='evolution'
                 ORDER BY created_at DESC LIMIT 2""", ((project_name or "").strip(),)).fetchall()] if project_name else []
+            
+            # P6a: 历史会议结论（自动引用）
+            roundtable_history = [dict(row) for row in conn.execute("""SELECT * FROM memories
+                WHERE source_type='roundtable'
+                ORDER BY created_at DESC LIMIT 3""").fetchall()]
+            
+            # P6a: 历史协作结果
+            swarm_history = [dict(row) for row in conn.execute("""SELECT * FROM memories
+                WHERE source_type='swarm'
+                AND project_name=? ORDER BY created_at DESC LIMIT 2""", ((project_name or "").strip(),)).fetchall()] if project_name else []
+        
+        # 合并去重
         global_rows = merge(global_evolution, self.search(query, limit=3), 3)
-        project_rows = merge(project_evolution, self.search(query, project_name=project_name, limit=5), 5) if project_name else []
+        project_rows = merge(project_evolution + roundtable_history + swarm_history, self.search(query, project_name=project_name, limit=5), 5) if project_name else []
         rows = global_rows + project_rows
         if not rows:
             return ""

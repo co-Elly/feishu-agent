@@ -196,5 +196,100 @@ class WorkflowStore:
             )
         return self.get(workflow_id)
 
+    # ---- P5c: 可恢复协作快照 ----
+
+    def export_audit_log(self, workflow_id) -> dict:
+        """导出完整决策链为可审计的 JSON 文件。
+
+        包含：工作流状态、任务清单、决策链、时间线。
+        系统重启后可通过 import_audit_log 恢复状态。
+        """
+        wf = self.get(workflow_id)
+        if not wf:
+            raise WorkflowTransitionError("工作流不存在")
+        task_data = wf.get("task_ledger") or {}
+        progress_data = wf.get("progress_ledger") or {}
+        timeline = self._build_timeline(wf, task_data, progress_data)
+        return {
+            "version": "1.0",
+            "workflow": wf,
+            "task_ledger": task_data,
+            "progress_ledger": progress_data,
+            "timeline": timeline,
+            "decision_chain": self._build_decision_chain(task_data),
+            "exported_at": time.time(),
+        }
+
+    def _build_timeline(self, wf, task_data, progress_data) -> list:
+        """构建时间线：按时间排序的所有状态变更和决策。"""
+        events = []
+        for decision in task_data.get("boss_decisions") or []:
+            events.append({
+                "type": "boss_decision",
+                "timestamp": decision.get("created_at", 0),
+                "data": decision,
+            })
+        for progress in progress_data.get("progress_events") or []:
+            events.append({
+                "type": "progress",
+                "timestamp": progress.get("created_at", 0),
+                "data": progress,
+            })
+        events.sort(key=lambda e: e.get("timestamp", 0))
+        return events
+
+    def _build_decision_chain(self, task_data) -> list:
+        """构建决策链：从会议到拍板到批准的完整链路。"""
+        chain = []
+        for decision in task_data.get("boss_decisions") or []:
+            chain.append({
+                "sequence": decision.get("sequence"),
+                "decision": decision.get("decision"),
+                "user_id": decision.get("user_id"),
+                "meeting_task_id": decision.get("meeting_task_id"),
+                "timestamp": decision.get("created_at"),
+            })
+        return chain
+
+    def import_audit_log(self, data: dict) -> str:
+        """从快照恢复工作流。
+
+        验证完整性后恢复状态机，返回新 workflow_id。
+        """
+        wf_data = data.get("workflow") or {}
+        if not wf_data.get("id"):
+            raise WorkflowTransitionError("快照缺少工作流 ID")
+        # 生成新 ID 避免冲突
+        new_id = "wf_" + uuid.uuid4().hex[:12]
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("""INSERT INTO workflow_instances(
+                id, chat_id, owner_user_id, project_name, state, root_request,
+                constraint_json, task_ledger_json, progress_ledger_json, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                new_id,
+                wf_data.get("chat_id", ""),
+                wf_data.get("owner_user_id"),
+                wf_data.get("project_name"),
+                wf_data.get("state", "meeting_discussion"),
+                wf_data.get("root_request", ""),
+                json.dumps(wf_data.get("constraint_envelope", {}), ensure_ascii=False),
+                json.dumps(data.get("task_ledger", {}), ensure_ascii=False),
+                json.dumps(data.get("progress_ledger", {}), ensure_ascii=False),
+                now, now,
+            ))
+        return new_id
+
+    def save_audit_snapshot(self, workflow_id, output_dir=None) -> str:
+        """将审计日志保存到文件。返回文件路径。"""
+        data = self.export_audit_log(workflow_id)
+        if not output_dir:
+            output_dir = os.path.join(os.path.dirname(self.db_path), "audit")
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"{workflow_id}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return path
+
 
 WORKFLOW_STORE = WorkflowStore()

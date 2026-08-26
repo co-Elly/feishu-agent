@@ -71,3 +71,57 @@ def trace_spans(trace_id, db_path=None):
 def ensure_observability_schema(db_path=None):
     with _connect(db_path):
         pass
+
+
+# ---- P6c: 异常告警 ----
+
+def get_recent_failures(window_seconds=300, db_path=None):
+    """获取最近 N 秒内的失败记录。"""
+    cutoff = time.time() - window_seconds
+    with _connect(db_path) as conn:
+        rows = conn.execute("""SELECT * FROM trace_spans
+            WHERE status='error' AND created_at >= ?
+            ORDER BY created_at DESC LIMIT 20""", (cutoff,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_engine_error_stats(window_seconds=3600, db_path=None):
+    """获取各引擎最近 N 秒内的错误统计。"""
+    cutoff = time.time() - window_seconds
+    with _connect(db_path) as conn:
+        rows = conn.execute("""SELECT engine, failure_category,
+            COUNT(*) as count, MAX(created_at) as last_occurrence
+            FROM trace_spans
+            WHERE status='error' AND created_at >= ?
+            GROUP BY engine, failure_category
+            ORDER BY count DESC""", (cutoff,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def check_engine_degradation(window_seconds=300, threshold=3, db_path=None):
+    """检查引擎是否降级（最近 N 秒内失败次数超过阈值）。"""
+    stats = get_engine_error_stats(window_seconds, db_path)
+    degraded = []
+    for stat in stats:
+        if stat["count"] >= threshold:
+            degraded.append({
+                "engine": stat["engine"],
+                "error_count": stat["count"],
+                "last_category": stat["failure_category"],
+                "last_occurrence": stat["last_occurrence"],
+            })
+    return degraded
+
+
+def format_alert_message(degraded_engines):
+    """格式化为飞书告警消息。"""
+    if not degraded_engines:
+        return None
+    lines = ["⚠️ **引擎降级告警**\n"]
+    for eng in degraded_engines:
+        lines.append(
+            f"  🔴 `{eng['engine']}`：{eng['error_count']} 次失败"
+            f"（最近：{eng['last_category']}）"
+        )
+    lines.append("\n建议：检查引擎状态或切换双人局模式。")
+    return "\n".join(lines)
