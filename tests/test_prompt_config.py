@@ -369,7 +369,7 @@ def test_render_prompt_default_and_context():
     assert "产品经理" in prompt
     assert "【发言要求】言简意赅" in prompt
     assert "⚠️ 这是真实工作议题" in prompt
-    assert "第一行写「立场：同意/补充/反对/弃权」" in prompt
+    assert "第一行写「立场：同意/补充/反对/弃权｜置信度：0.0-1.0」" in prompt
 
 
 def test_render_prompt_valid_style_overrides():
@@ -413,7 +413,7 @@ def test_render_prompt_immutable_system_constraints_and_persona():
     assert "Codex" in prompt
     # 核心系统约束不可丢
     assert "⚠️ 这是真实工作议题，发言必须落在事实上" in prompt
-    assert "第一行写「立场：同意/补充/反对/弃权」" in prompt
+    assert "第一行写「立场：同意/补充/反对/弃权｜置信度：0.0-1.0」" in prompt
     # Codex 独有的只读约束不可丢
     assert "绝对不要反问、不要要求澄清、不要列问题选项" in prompt
 

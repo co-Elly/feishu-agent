@@ -209,6 +209,65 @@ def test_dedup_result_reads_minutes(_rt_db):
     assert "共识是好的" in res["final_summary"]
 
 
+# ---------------- P2 置信度加权共识 v3 ----------------
+
+def test_extract_stance_confidence_parses():
+    s, c = re_.extract_stance_confidence("立场：同意｜置信度：0.8\n方案可行")
+    assert s == "同意" and c == 0.8
+
+
+def test_extract_stance_confidence_default():
+    s, c = re_.extract_stance_confidence("立场：同意\n方案可行")
+    assert s == "同意" and c == 0.5
+
+
+def test_extract_stance_confidence_clamps_out_of_range():
+    _, c1 = re_.extract_stance_confidence("立场：反对｜置信度：1.7")
+    _, c2 = re_.extract_stance_confidence("立场：反对｜置信度：-0.3")
+    assert c1 == 1.0 and c2 == 0.0
+
+
+def test_extract_stance_confidence_backward_compat():
+    """旧格式（无置信度）不破坏立场提取。"""
+    assert re_.extract_stance_confidence("立场：补充\n加一条")[0] == "补充"
+
+
+def test_weighted_consensus_high_score():
+    stances = {"a": ("同意", 0.9), "b": ("同意", 0.8)}
+    conv, how, score = re_.weighted_consensus(2, stances)
+    assert conv and how == "consensus" and score >= 0.6
+
+
+def test_weighted_consensus_low_confidence_veto():
+    """低置信同意堆量不足以触发共识（修复伪共识）。"""
+    stances = {"a": ("同意", 0.3), "b": ("补充", 0.5), "c": ("同意", 0.4)}
+    conv, how, score = re_.weighted_consensus(2, stances)
+    assert not conv and score < 0.6
+
+
+def test_weighted_consensus_high_conf_oppose_blocks():
+    stances = {"a": ("同意", 0.9), "b": ("同意", 0.9), "c": ("反对", 0.8)}
+    conv, how, _ = re_.weighted_consensus(2, stances)
+    assert not conv
+
+
+def test_weighted_consensus_low_conf_oppose_no_extra_block():
+    """低置信反对仍按普通 dissent 处理（阻断但走同一路径）。"""
+    stances = {"a": ("同意", 0.9), "b": ("反对", 0.4)}
+    conv, _, score = re_.weighted_consensus(2, stances)
+    assert not conv  # 有 dissent 本身就阻断
+
+
+def test_weighted_consensus_round1_never():
+    stances = {"a": ("同意", 0.95), "b": ("同意", 0.9)}
+    assert re_.weighted_consensus(1, stances)[0] is False
+
+
+def test_meeting_converged_backward_compat():
+    """P2 不破坏旧判定函数。"""
+    assert re_.meeting_converged(2, {"pm": "同意"}, None) == (True, "consensus")
+
+
 if __name__ == "__main__":
     # 无 pytest 时也能直接跑
     import traceback

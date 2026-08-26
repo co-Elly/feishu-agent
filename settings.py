@@ -396,7 +396,7 @@ def render_prompt(role, ctx=None, override=None):
         f"【你的身份】{role_desc}\n"
         f"【当前轮次】第 {round_no} 轮\n{stage}\n"
         f"【发言要求】{effective_style} 输出格式：\n"
-        f"第一行写「立场：同意/补充/反对/弃权」\n"
+        f"第一行写「立场：同意/补充/反对/弃权｜置信度：0.0-1.0」（置信度=你对该立场的把握，如 0.8）\n"
         f"然后给出你的专业意见（≤180字）。只输出发言内容本身，不要思考过程。"
     )
     if engine_type == "codex":

@@ -636,12 +636,15 @@ def _run_roundtable_task(client, task, context):
                 if sent:
                     last_speech_msg_id = sent
         elif event_type == "round_end":
-            context.progress(f"第 {payload['round']} 轮结束")
+            score = payload.get("consensus_score")
+            score_txt = f" · 共识度 {score:.2f}" if isinstance(score, (int, float)) else ""
+            context.progress(f"第 {payload['round']} 轮结束{score_txt}")
             if workflow_id:
                 WORKFLOW_STORE.update_ledgers(workflow_id, progress_ledger={
                     "round": payload["round"], "stances": payload.get("stances") or {},
                     "consensus": bool(payload.get("consensus")),
                     "fixed_point": bool(payload.get("fixed_point")),
+                    "consensus_score": score,
                     "making_progress": not bool(payload.get("fixed_point")),
                 })
         elif event_type == "agent_error":

@@ -472,6 +472,58 @@ def meeting_converged(round_no, stances_now, prev_stances):
     return False, "running"
 
 
+# ---------------- P2 置信度加权共识 v3 ----------------
+# 发言首行可带「立场：同意｜置信度：0.8」；缺省置信度 0.5。
+# 共识判定升级为加权聚合（对标 Roundtable Policy, arXiv:2509.16839）：
+#   加权同意分 = Σ 置信度(同意) ；高置信反对 = 任一 反对 且 置信度 ≥ CONF oppose 阈值
+STANCE_CONF_PAT = re.compile(
+    r"(?:【?立场】?|\*\*立场\*\*)\s*[：:]\s*(同意|赞同|补充|反对|弃权|中立)"
+    r"[\s*｜|，,;；]*置信度\s*[：:]\s*(-?[0-9](?:\.\d+)?)",
+)
+DEFAULT_STANCE_CONFIDENCE = 0.5
+CONF_OPPOSE_BLOCK_THRESHOLD = 0.7   # 高置信反对直接阻断共识
+CONF_CONSENSUS_RATIO = 0.6          # 加权同意分占比阈值
+
+
+def extract_stance_confidence(text):
+    """提取 (stance, confidence)。置信度缺省 0.5，越界值截断到 [0,1]。"""
+    stance = extract_stance(text)
+    conf = DEFAULT_STANCE_CONFIDENCE
+    m = STANCE_CONF_PAT.search(text)
+    if m:
+        try:
+            conf = max(0.0, min(1.0, float(m.group(2))))
+        except ValueError:
+            pass
+    return stance, round(conf, 2)
+
+
+def weighted_consensus(round_no, stances_with_conf):
+    """置信度加权共识（纯函数）。
+
+    stances_with_conf: {agent_key: (stance, confidence)}
+    返回 (converged, how, consensus_score)：
+    - 高置信反对（≥0.7）→ 永不共识（阻断）
+    - 共识 = ≥2轮 且 无反对/中立 且 Σ同意置信度 / 有效成员数 ≥ 0.6
+      （低置信同意堆量不足以触发提前收敛——修复"补充+低置信同意=伪共识"）
+    """
+    if round_no < 2 or not stances_with_conf:
+        return False, "running", 0.0
+    valid = [(s, c) for s, c in stances_with_conf.values() if s != "不可用"]
+    if not valid:
+        return False, "running", 0.0
+    n = len(valid)
+    agree_score = sum(c for s, c in valid if s == "同意")
+    high_conf_oppose = any(s == "反对" and c >= CONF_OPPOSE_BLOCK_THRESHOLD for s, c in valid)
+    has_dissent = any(s in ("反对", "中立") for s, _ in valid)
+    score = round(agree_score / n, 3)
+    if high_conf_oppose or has_dissent:
+        return False, "running", score
+    if n >= 2 and score >= CONF_CONSENSUS_RATIO:
+        return True, "consensus", score
+    return False, "running", score
+
+
 ENGINE_CALLS = {
     "hermes": call_hermes,
     "antigravity": call_antigravity,
@@ -677,9 +729,11 @@ class RoundTableV2:
         # 黑板
         transcript = []  # {turn, agent, stance, text, ts}
         stances_history = []  # 每轮的立场 dict
+        stances_conf_history = []  # 每轮的 (stance, confidence) dict（P2 加权共识）
         active_order = list(selected_order)
         unavailable_agents = {}
         round_no = 1
+        consensus_score = 0.0
 
         try:
             if cancel_check:
@@ -731,6 +785,7 @@ class RoundTableV2:
 
                 # 记录本轮发言到黑板
                 stances_now = {}
+                stances_conf_now = {}
                 failed_this_round = []
                 for k in current_order:
                     if is_engine_error(results[k]):
@@ -743,7 +798,9 @@ class RoundTableV2:
                             on_event("agent_error", {"agent": AGENTS[k]["name"], "error": results[k]})
                         continue
                     stance = extract_stance(results[k])
+                    stance_conf = extract_stance_confidence(results[k])
                     stances_now[k] = stance
+                    stances_conf_now[k] = stance_conf
                     entry = {"turn": f"r{round_no}-{k}", "agent": k, "stance": stance, "text": results[k], "ts": time.strftime("%H:%M:%S")}
                     transcript.append(entry)
                     _write_board(session_id, "transcript.jsonl", entry)
@@ -755,6 +812,7 @@ class RoundTableV2:
                     names = "、".join(AGENTS[key]["name"] for key in unavailable_agents)
                     raise RoundTableQuorumError(f"有效成员不足 2 人；不可用成员：{names}")
                 stances_history.append(stances_now)
+                stances_conf_history.append(stances_conf_now)
 
                 # 收敛判定
                 dv = divergence(stances_now, stances_history[-2] if len(stances_history) > 1 else None)
@@ -763,6 +821,16 @@ class RoundTableV2:
                 converged, how = meeting_converged(round_no, stances_now, prev_stances)
                 consensus = (how == "consensus")
                 fixed_point = (how == "fixed_point")
+                # P2 加权共识：置信度聚合复核——低置信同意不足 0.6 占比时不提前收敛；
+                # 高置信反对（≥0.7）直接否决共识。两者取交集（都通过才算共识收敛）。
+                # 兼容回退：本场若没有任何发言携带显式置信度（全部缺省 0.5），
+                # 说明引擎是旧格式输出，跳过加权复核，维持 legacy 判定。
+                any_explicit_conf = any(c != DEFAULT_STANCE_CONFIDENCE for _, c in stances_conf_now.values())
+                w_converged, w_how, consensus_score = weighted_consensus(round_no, stances_conf_now)
+                if consensus and not w_converged and any_explicit_conf:
+                    logger.info("roundtable: weighted veto — nominal consensus but score %.2f < %.2f",
+                                consensus_score, CONF_CONSENSUS_RATIO)
+                    consensus = False
 
                 state = {
                     "session_id": session_id,
@@ -771,11 +839,13 @@ class RoundTableV2:
                     "divergence": dv,
                     "consensus": consensus,
                     "fixed_point": fixed_point,
+                    "consensus_score": consensus_score,
                     "unavailable_agents": list(unavailable_agents),
                 }
                 save_session_state(session_id, state)
                 if on_event:
-                    on_event("round_end", {"round": round_no, "stances": stances_now, "consensus": consensus, "fixed_point": fixed_point})
+                    on_event("round_end", {"round": round_no, "stances": stances_now, "consensus": consensus,
+                                           "fixed_point": fixed_point, "consensus_score": consensus_score})
 
                 if consensus or fixed_point:
                     if on_event:
@@ -798,6 +868,7 @@ class RoundTableV2:
                     "calls": self._calls,
                     "cache_hits": self._cache_hits,
                     "errors": self._errors,
+                    "consensus_score": consensus_score,
                 })
             # 会议生命周期收口：置 done（此前永远停在 running）
             try:
