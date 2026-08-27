@@ -71,6 +71,15 @@ class IngressBridge:
     def start(self):
         bridge = self
 
+        class ThreadedHTTPServerWithReuse(ThreadingHTTPServer):
+            """HTTP server with SO_REUSEADDR to allow quick restart."""
+            allow_reuse_address = True
+            
+            def server_bind(self):
+                import socket
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                super().server_bind()
+
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path != "/health":
@@ -108,7 +117,7 @@ class IngressBridge:
             def log_message(self, fmt, *args):
                 return
 
-        self.server = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.server = ThreadedHTTPServerWithReuse((self.host, self.port), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, name="ingress-bridge", daemon=True)
         self.thread.start()
         return self

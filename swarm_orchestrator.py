@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from agent_runtime import call_antigravity, call_codex, call_hermes
+from agent_runtime import call_antigravity, call_codex, call_hermes, AgentResult
 from antigravity_first_pass import (
     AntigravityFirstPassError, apply_validated_patch, build_source_context,
     extract_unified_diff, normalize_relative, path_allowed,
@@ -217,16 +217,26 @@ class MultiAgentSwarm:
         emit("📐 架构师", arch_result.text)
         checkpoint()
 
-        audit("🔎 Codex 只读探索", "codex", scout_result)
-        if not scout_result.ok:
-            raise RuntimeError(f"Codex 只读探索失败：{scout_result.text}")
-        emit("🔎 Codex 只读探索", scout_result.text)
-        checkpoint()
+        # P5a 降级：Codex 不可用时自动改为 PM+Arch 二人预审
+        scout_ok = scout_result.ok and scout_result.text.strip()
+        scout_text = scout_result.text if scout_ok else ""
+        if not scout_ok:
+            warning = (
+                "⚠️ Codex 探索员不可用（网络超时/熔断），"
+                "自动降级为 PM+Arch 双人预审模式。"
+            )
+            emit("🛡️ 降级提示", warning)
+            audit("🛡️ 降级提示", "local", AgentResult(ok=True, text=warning))
+            checkpoint()
+        else:
+            audit("🔎 Codex 只读探索", "codex", scout_result)
+            emit("🔎 Codex 只读探索", scout_result.text)
+            checkpoint()
 
         approved_paths = sorted(
             constraint_envelope["allowed_paths"] if constraint_envelope.get("scope_restricted")
             else _approved_scope({
-                "goal": f"{user_goal}\n{arch_result.text}\n{scout_result.text}",
+                "goal": f"{user_goal}\n{arch_result.text}\n{scout_text}",
                 "requirements": pm_result.text,
             })
         )
@@ -237,15 +247,16 @@ class MultiAgentSwarm:
             "goal": user_goal,
             "requirements": pm_result.text,
             "architecture": arch_result.text,
-            "research": scout_result.text,
-            "research_ok": scout_result.ok,
+            "research": scout_text,
+            "research_ok": scout_ok,
             "impact_and_risks": arch_result.text,
             "constraint_envelope": constraint_envelope,
             "approved_scope": {"allowed_paths": approved_paths},
             "independent_review": {
                 "pm": pm_result.text,
                 "architect": arch_result.text,
-                "scout": scout_result.text,
+                "scout": scout_text,
+                "degraded": not scout_ok,
             },
             "handoff_contract": {
                 "objective": user_goal,
